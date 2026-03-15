@@ -1,9 +1,17 @@
+"""浏览器执行底座工具。
+
+这个文件是浏览器 Agent 最重的一层，负责：
+- 浏览器会话创建与接管
+- CDP / 本地浏览器探测
+- creditchina private-api / DOM 查询执行
+- 结果落盘与调试信息整理
+- 给 browser_react skill 暴露工具集
+"""
+
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import hmac
 import json
 import os
 import platform
@@ -12,7 +20,6 @@ import shutil
 import subprocess
 import time
 from datetime import datetime
-from functools import lru_cache
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
@@ -29,6 +36,8 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from chat_memory import get_conversation_memory_service
+from rag_kb import get_rag_knowledge_service
 from 智能体配置 import (
     ARTIFACT_DIR,
     DEFAULT_API_BASE_URL,
@@ -39,7 +48,6 @@ from 智能体配置 import (
     DEFAULT_CAPTCHA_OCR_MODEL,
     DEFAULT_CDP_ATTACH_EXISTING_PAGE,
     DEFAULT_CDP_URL,
-    DEFAULT_DEPLOYMENT_MODE,
     DEFAULT_LAUNCH_HEADLESS,
     DEFAULT_MODEL,
     DEFAULT_SITE_PASSWORD,
@@ -51,8 +59,8 @@ from 智能体配置 import (
     build_session_file_paths,
     normalize_browser_mode,
 )
-from 模型工具 import load_agent_api_key
-from 验证码工具 import solve_captcha_bytes, solve_captcha_file
+from .tool_captcha import solve_captcha_bytes, solve_captcha_file
+from .tool_model_client import load_agent_api_key
 
 __all__ = [
     "AsyncBrowserSession",
@@ -63,13 +71,7 @@ __all__ = [
     "runtime_metadata",
 ]
 
-OPENCLAW_RELAY_AUTH_HEADER = "x-openclaw-relay-token"
-OPENCLAW_RELAY_TOKEN_CONTEXT = "openclaw-extension-relay-v1"
-OPENCLAW_CONFIG_CANDIDATES = (
-    Path("/host-openclaw/openclaw.json"),
-    Path.home() / ".openclaw" / "openclaw.json",
-)
-LOCAL_CDP_HOSTS = {"127.0.0.1", "localhost", "::1", "host.docker.internal"}
+LOCAL_CDP_HOSTS = {"127.0.0.1", "localhost", "::1"}
 MACOS_CHROME_CANDIDATES = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
@@ -79,6 +81,7 @@ MACOS_CHROME_CANDIDATES = (
 
 
 def detect_chromium() -> str:
+    """定位当前机器可用的 Chromium / Chrome 可执行文件。"""
     # Playwright 负责浏览器控制，但在本地启动前仍需要先定位到 Chromium/Chrome 的可执行文件。
     explicit_path = DEFAULT_BROWSER_EXECUTABLE.strip()
     if explicit_path:
@@ -103,6 +106,7 @@ def detect_chromium() -> str:
 
 
 def _sanitize_filename(raw_value: str, default_name: str = "artifact.png") -> str:
+    """把任意文件名清洗成适合落盘的安全文件名。"""
     text = FILENAME_SANITIZER.sub("-", str(raw_value or "").strip()).strip("-.")
     if not text:
         return default_name
@@ -110,10 +114,12 @@ def _sanitize_filename(raw_value: str, default_name: str = "artifact.png") -> st
 
 
 def _trim_text(value: str, max_chars: int) -> str:
+    """把文本截断到指定长度，避免调试信息过大。"""
     return str(value or "")[:max(0, int(max_chars))]
 
 
 def _mask_secret(value: str, *, keep_prefix: int = 4, keep_suffix: int = 4) -> str:
+    """对长敏感值做部分保留式脱敏。"""
     text = str(value or "").strip()
     if not text:
         return ""
@@ -123,6 +129,7 @@ def _mask_secret(value: str, *, keep_prefix: int = 4, keep_suffix: int = 4) -> s
 
 
 def _redact_short_secret(value: str) -> str:
+    """对短敏感值做完全脱敏，只保留长度信息。"""
     text = str(value or "").strip()
     if not text:
         return ""
@@ -130,6 +137,7 @@ def _redact_short_secret(value: str) -> str:
 
 
 def _sanitize_sensitive_string(value: str) -> str:
+    """在普通字符串里替换已知敏感片段。"""
     text = str(value or "")
     if not text:
         return ""
@@ -150,6 +158,7 @@ def _sanitize_sensitive_string(value: str) -> str:
 
 
 def _sanitize_header_mapping(headers: dict[str, Any]) -> dict[str, Any]:
+    """对 HTTP 头做脱敏，避免 cookie / authorization 原文落盘。"""
     sanitized: dict[str, Any] = {}
     for name, value in headers.items():
         lower_name = str(name or "").strip().lower()
@@ -164,6 +173,7 @@ def _sanitize_header_mapping(headers: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sanitize_debug_payload(value: Any, *, parent_key: str = "") -> Any:
+    """递归清洗调试 payload 中的敏感字段。"""
     key = str(parent_key or "").strip().lower()
     if isinstance(value, dict):
         if key == "headers":
@@ -183,6 +193,7 @@ def _sanitize_debug_payload(value: Any, *, parent_key: str = "") -> Any:
 
 
 def _sanitize_text_payload(value: str) -> str:
+    """对文本结果做统一脱敏；若内容是 JSON，会先解析再清洗。"""
     text = str(value or "")
     if not text.strip():
         return text
@@ -194,6 +205,7 @@ def _sanitize_text_payload(value: str) -> str:
 
 
 def _extract_cookie_names(raw_header: str) -> list[str]:
+    """从 Set-Cookie 头里只提取 cookie 名称列表。"""
     names = re.findall(r"(?:^|,\s*)([^=;,\s]+)=", str(raw_header or ""))
     deduped: list[str] = []
     for name in names:
@@ -203,6 +215,7 @@ def _extract_cookie_names(raw_header: str) -> list[str]:
 
 
 def _normalize_cdp_url(raw_value: str | None) -> str:
+    """把 CDP 地址规范成不带尾部 `/json/version` 的统一形式。"""
     url = str(raw_value or "").strip()
     if not url:
         return ""
@@ -212,70 +225,12 @@ def _normalize_cdp_url(raw_value: str | None) -> str:
 
 
 def _is_local_cdp_host(hostname: str | None) -> bool:
+    """判断 CDP 主机是否属于本机 / 容器内常见本地地址。"""
     return (str(hostname or "").strip().lower() or "") in LOCAL_CDP_HOSTS
 
 
-@lru_cache(maxsize=1)
-def _load_openclaw_config() -> dict[str, Any]:
-    for path in OPENCLAW_CONFIG_CANDIDATES:
-        if not path.exists():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    return {}
-
-
-@lru_cache(maxsize=1)
-def _load_openclaw_gateway_token() -> str:
-    for name in ("OPENCLAW_GATEWAY_TOKEN", "CLAWDBOT_GATEWAY_TOKEN"):
-        value = str(os.getenv(name) or "").strip()
-        if value:
-            return value
-    config_payload = _load_openclaw_config()
-    gateway = config_payload.get("gateway") if isinstance(config_payload, dict) else None
-    auth = gateway.get("auth") if isinstance(gateway, dict) else None
-    token = auth.get("token") if isinstance(auth, dict) else None
-    return str(token or "").strip()
-
-
-@lru_cache(maxsize=1)
-def _load_openclaw_gateway_port() -> int:
-    config_payload = _load_openclaw_config()
-    gateway = config_payload.get("gateway") if isinstance(config_payload, dict) else None
-    raw_port = gateway.get("port") if isinstance(gateway, dict) else None
-    try:
-        port = int(raw_port)
-    except (TypeError, ValueError):
-        return 0
-    return port if 0 < port < 65536 else 0
-
-
-def _derive_openclaw_relay_auth_headers(cdp_url: str) -> dict[str, str]:
-    normalized = _normalize_cdp_url(cdp_url)
-    if not normalized:
-        return {}
-    parsed = urlparse(normalized)
-    if not _is_local_cdp_host(parsed.hostname):
-        return {}
-    port = parsed.port
-    if port is None or port <= 0:
-        return {}
-    gateway_token = _load_openclaw_gateway_token()
-    if not gateway_token:
-        return {}
-    digest = hmac.new(
-        gateway_token.encode("utf-8"),
-        f"{OPENCLAW_RELAY_TOKEN_CONTEXT}:{port}".encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return {OPENCLAW_RELAY_AUTH_HEADER: digest}
-
-
 def _basic_auth_headers_from_url(cdp_url: str) -> dict[str, str]:
+    """如果 CDP URL 自带用户名密码，就构造 Basic Auth 头。"""
     parsed = urlparse(str(cdp_url or "").strip())
     if not (parsed.username or parsed.password):
         return {}
@@ -285,10 +240,8 @@ def _basic_auth_headers_from_url(cdp_url: str) -> dict[str, str]:
 
 
 def _build_cdp_request_headers(cdp_url: str) -> dict[str, str]:
-    return {
-        **_derive_openclaw_relay_auth_headers(cdp_url),
-        **_basic_auth_headers_from_url(cdp_url),
-    }
+    """汇总连接 CDP 端点时需要带的请求头。"""
+    return _basic_auth_headers_from_url(cdp_url)
 
 
 def _probe_cdp_endpoint(
@@ -297,6 +250,7 @@ def _probe_cdp_endpoint(
     timeout_seconds: float = 1.5,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """探测 CDP 端点是否可用，并返回 `/json/version` 信息。"""
     normalized = _normalize_cdp_url(cdp_url)
     if not normalized:
         raise RuntimeError("CDP URL 为空。")
@@ -316,9 +270,11 @@ def _probe_cdp_endpoint(
 
 
 def _default_cdp_candidate_urls(primary_url: str | None) -> list[str]:
+    """根据部署环境构造一组可尝试的 CDP 地址候选。"""
     candidates: list[str] = []
 
     def push(url: str | None) -> None:
+        """把候选 URL 规范化后去重加入列表。"""
         normalized = _normalize_cdp_url(url)
         if normalized and normalized not in candidates:
             candidates.append(normalized)
@@ -332,26 +288,14 @@ def _default_cdp_candidate_urls(primary_url: str | None) -> list[str]:
     primary_host = (parsed_primary.hostname or "").strip().lower() if parsed_primary else ""
     if primary_host:
         preferred_hosts.append(primary_host)
-    deployment_mode = DEFAULT_DEPLOYMENT_MODE
-    if deployment_mode == "container":
-        preferred_hosts.extend(["host.docker.internal", "127.0.0.1", "localhost"])
-    else:
-        # Linux 宿主部署默认优先直连本机 9222，再把容器侧地址作为兜底候选。
-        preferred_hosts.extend(["127.0.0.1", "localhost", "host.docker.internal"])
-    if Path("/hostfs").exists():
-        preferred_hosts.append("host.docker.internal")
+    # 当前交付物只保留本机 CDP / 本地 launch 路径，不再尝试 OpenClaw relay 或容器侧桥接地址。
+    preferred_hosts.extend(["127.0.0.1", "localhost"])
 
     host_candidates: list[str] = []
     for host in preferred_hosts:
         normalized_host = str(host or "").strip().lower()
         if normalized_host and normalized_host not in host_candidates:
             host_candidates.append(normalized_host)
-
-    gateway_port = _load_openclaw_gateway_port()
-    if gateway_port:
-        relay_port = gateway_port + 3
-        for host in host_candidates:
-            push(f"http://{host}:{relay_port}")
 
     for host in host_candidates:
         push(f"http://{host}:9222")
@@ -360,6 +304,7 @@ def _default_cdp_candidate_urls(primary_url: str | None) -> list[str]:
 
 
 def _validate_launch_runtime(*, headless: bool, auto_xvfb_enabled: bool) -> None:
+    """在真正启动浏览器前，验证当前运行环境是否满足条件。"""
     if headless:
         return
     if platform.system() == "Darwin":
@@ -373,11 +318,11 @@ def _validate_launch_runtime(*, headless: bool, auto_xvfb_enabled: bool) -> None
 
 
 def runtime_metadata() -> dict[str, str]:
+    """导出当前浏览器 Agent 的关键运行配置，供页面和诊断接口展示。"""
     session_paths = build_session_file_paths(DEFAULT_BASE_URL)
-    return {
+    metadata = {
         "model": DEFAULT_MODEL,
         "api_base_url": DEFAULT_API_BASE_URL,
-        "deployment_mode": DEFAULT_DEPLOYMENT_MODE,
         "browser_mode": DEFAULT_BROWSER_MODE,
         "browser_executable": DEFAULT_BROWSER_EXECUTABLE,
         "cdp_url": DEFAULT_CDP_URL,
@@ -395,9 +340,47 @@ def runtime_metadata() -> dict[str, str]:
         "default_cookie_header_path": str(session_paths["cookie_header_path"]),
         "default_invalid_marker_path": str(session_paths["invalid_marker_path"]),
     }
+    memory_service = get_conversation_memory_service()
+    if memory_service is None:
+        metadata.update(
+            {
+                "chat_memory_enabled": "0",
+                "chat_memory_backend": "disabled",
+            }
+        )
+        return metadata
+    try:
+        metadata.update(memory_service.runtime_metadata())
+    except Exception as exc:
+        metadata.update(
+            {
+                "chat_memory_enabled": "1",
+                "chat_memory_backend": "postgresql",
+                "chat_memory_error": str(exc),
+            }
+        )
+    rag_service = get_rag_knowledge_service()
+    if rag_service is None:
+        metadata.update(
+            {
+                "rag_enabled": "0",
+            }
+        )
+        return metadata
+    try:
+        metadata.update(rag_service.runtime_metadata())
+    except Exception as exc:
+        metadata.update(
+            {
+                "rag_enabled": "1",
+                "rag_error": str(exc),
+            }
+        )
+    return metadata
 
 
 def playwright_agent_is_ready() -> tuple[bool, str]:
+    """做一轮运行前自检，判断浏览器和模型链路是否已就绪。"""
     try:
         browser_mode = normalize_browser_mode(DEFAULT_BROWSER_MODE)
         normalized_cdp_url = _normalize_cdp_url(DEFAULT_CDP_URL)
@@ -432,12 +415,25 @@ def playwright_agent_is_ready() -> tuple[bool, str]:
                 auto_xvfb_enabled=DEFAULT_AUTO_XVFB_ENABLED,
             )
         load_agent_api_key()
+        memory_service = get_conversation_memory_service()
+        if memory_service is not None:
+            memory_service.healthcheck()
+        rag_service = get_rag_knowledge_service()
+        if rag_service is not None:
+            rag_service.healthcheck()
         return True, ""
     except Exception as exc:
         return False, str(exc)
 
 
 class AsyncBrowserSession:
+    """浏览器会话封装。
+
+    负责统一处理两种模式：
+    - 通过 CDP 接管已有浏览器
+    - 本地直接拉起一个新浏览器
+    """
+
     def __init__(
         self,
         *,
@@ -455,6 +451,7 @@ class AsyncBrowserSession:
         xvfb_display: str | None = None,
         xvfb_screen: str | None = None,
     ):
+        """初始化一次浏览器会话，但此时还不会真正连接 / 启动浏览器。"""
         self.headless = headless
         self.base_url = str(base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
         session_paths = build_session_file_paths(self.base_url)
@@ -504,6 +501,7 @@ class AsyncBrowserSession:
         self.page: AsyncPage | None = None
 
     def _browser_profile_metadata(self) -> dict[str, Any]:
+        """返回本地 launch 浏览器时使用的拟真画像配置。"""
         return {
             "profile_name": "desktop_zh_cn_chrome",
             "viewport": {"width": 1366, "height": 900},
@@ -520,6 +518,7 @@ class AsyncBrowserSession:
         }
 
     def _cdp_profile_metadata(self) -> dict[str, Any]:
+        """返回接管已有 CDP 浏览器时的画像与连接信息。"""
         return {
             "profile_name": "host_chrome_via_cdp",
             "target_host": (urlparse(self.base_url).hostname or "").strip().lower(),
@@ -529,6 +528,7 @@ class AsyncBrowserSession:
         }
 
     def _browser_launch_args(self) -> list[str]:
+        """返回启动本地浏览器时附加的命令行参数。"""
         return [
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -538,6 +538,7 @@ class AsyncBrowserSession:
         ]
 
     def _browser_context_options(self, storage_state_payload: dict[str, Any] | None) -> dict[str, Any]:
+        """构造 Playwright browser context 的统一选项。"""
         profile = self._browser_profile_metadata()
         return {
             "viewport": dict(profile["viewport"]),
@@ -557,6 +558,7 @@ class AsyncBrowserSession:
         }
 
     def _browser_stealth_script(self) -> str:
+        """返回注入页面的拟真脚本，用来降低自动化痕迹。"""
         return """
 (() => {
   const defineGetter = (object, property, getter) => {
@@ -722,6 +724,7 @@ class AsyncBrowserSession:
 """
 
     def _ensure_session_parent_dirs(self) -> None:
+        """确保所有会话文件的父目录都已经创建好。"""
         for path in (
             self.storage_state_path,
             self.cookies_path,
@@ -731,6 +734,7 @@ class AsyncBrowserSession:
             path.parent.mkdir(parents=True, exist_ok=True)
 
     def _load_storage_state_payload(self) -> dict[str, Any] | None:
+        """从 storageState 文件加载会话快照。"""
         if not self.storage_state_path.exists():
             return None
         payload = json.loads(self.storage_state_path.read_text(encoding="utf-8"))
@@ -745,6 +749,7 @@ class AsyncBrowserSession:
         return payload
 
     def _prefer_cookie_source(self) -> bool:
+        """比较会话文件时间，决定优先使用 cookie 还是 storageState。"""
         storage_mtime = self.storage_state_path.stat().st_mtime if self.storage_state_path.exists() else -1.0
         cookie_mtimes = [
             path.stat().st_mtime
@@ -756,13 +761,16 @@ class AsyncBrowserSession:
         return max(cookie_mtimes) > storage_mtime
 
     def _target_host(self) -> str:
+        """返回当前 base_url 的目标域名。"""
         return (urlparse(self.base_url).hostname or "").strip().lower()
 
     def _is_internal_browser_page_url(self, raw_url: str) -> bool:
+        """判断页面是否是浏览器内部页面而非业务页面。"""
         normalized = str(raw_url or "").strip().lower()
         return normalized.startswith(("devtools://", "chrome-extension://", "edge-extension://"))
 
     def _is_blankish_browser_page_url(self, raw_url: str) -> bool:
+        """判断页面是否属于空白页 / 新标签页一类的可复用页面。"""
         normalized = str(raw_url or "").strip().lower()
         return normalized in {
             "",
@@ -773,14 +781,17 @@ class AsyncBrowserSession:
         }
 
     def _page_matches_target_host(self, page: AsyncPage) -> bool:
+        """判断某个页面是否已经位于目标业务域名。"""
         page_host = (urlparse(page.url or "").hostname or "").strip().lower()
         target_host = self._target_host()
         return bool(page_host and target_host and page_host == target_host)
 
     def _iter_usable_cdp_pages(self, context: AsyncBrowserContext) -> list[AsyncPage]:
+        """筛出一个 context 里真正可用的业务页面。"""
         return [page for page in context.pages if not self._is_internal_browser_page_url(page.url or "")]
 
     def _select_cdp_context(self, browser: AsyncBrowser) -> AsyncBrowserContext:
+        """在接管 CDP 浏览器后，选择最合适的 browser context。"""
         contexts = list(browser.contexts)
         if not contexts:
             raise RuntimeError("connect_over_cdp 已连接到浏览器，但没有可用的 browser context。")
@@ -792,6 +803,7 @@ class AsyncBrowserSession:
         return contexts[0]
 
     def _select_existing_cdp_page(self, context: AsyncBrowserContext) -> AsyncPage | None:
+        """在已有 context 中选择一个最适合接管的页面。"""
         if not self.cdp_attach_existing_page:
             return None
         pages = self._iter_usable_cdp_pages(context)
@@ -806,6 +818,7 @@ class AsyncBrowserSession:
         return None
 
     def _build_cookie_entry(self, name: str, value: str) -> dict[str, Any]:
+        """把简单 cookie 键值对包装成 Playwright 可接受的结构。"""
         return {
             "name": name,
             "value": value,
@@ -813,6 +826,7 @@ class AsyncBrowserSession:
         }
 
     def _parse_cookie_header(self, raw_text: str) -> list[dict[str, Any]]:
+        """把 cookie header 文本解析成 Playwright cookie 列表。"""
         cookie = SimpleCookie()
         cookie.load(str(raw_text or ""))
         cookies: list[dict[str, Any]] = []
@@ -833,6 +847,7 @@ class AsyncBrowserSession:
         return fallback
 
     def _load_cookies_payload(self) -> list[dict[str, Any]]:
+        """从 cookies.json 或 cookie_header.txt 中加载 cookie 集合。"""
         candidates = [
             (self.cookies_path, "cookies_json"),
             (self.cookie_header_path, "cookie_header"),
@@ -864,6 +879,7 @@ class AsyncBrowserSession:
         return []
 
     async def persist_storage_state(self, *, target_url: str | None = None) -> str:
+        """把当前浏览器上下文的 storageState 持久化到会话文件。"""
         if self._context is None or not self.persist_session:
             return ""
         self._ensure_session_parent_dirs()
@@ -881,6 +897,7 @@ class AsyncBrowserSession:
         return self._persisted_session_path
 
     def mark_session_invalid(self, *, reason: str, diagnosis: dict[str, Any] | None = None) -> str:
+        """把当前会话标记为失效，供下次运行时识别和绕开。"""
         self._ensure_session_parent_dirs()
         payload = {
             "reason": reason,
@@ -896,6 +913,7 @@ class AsyncBrowserSession:
         return str(self.invalid_marker_path)
 
     def session_debug_state(self) -> dict[str, Any]:
+        """导出当前浏览器会话的调试状态快照。"""
         return {
             "loaded_session_source": self._loaded_session_source,
             "loaded_session_path": self._loaded_session_path,
@@ -934,11 +952,13 @@ class AsyncBrowserSession:
         }
 
     def _current_cdp_candidate_urls(self) -> list[str]:
+        """刷新并返回当前这次运行要尝试的 CDP 地址列表。"""
         candidates = _default_cdp_candidate_urls(self.cdp_url)
         self._cdp_candidate_urls = candidates
         return candidates
 
     def _prepare_launch_env(self) -> dict[str, str]:
+        """准备浏览器启动环境；必要时自动拉起 Xvfb。"""
         launch_env = {str(key): str(value) for key, value in os.environ.items()}
         if self.headless:
             self._launch_display = str(launch_env.get("DISPLAY") or "").strip()
@@ -990,6 +1010,7 @@ class AsyncBrowserSession:
         return launch_env
 
     async def _connect_existing_browser_via_cdp(self, candidate_url: str) -> None:
+        """通过 CDP 接管一个已经存在的浏览器实例。"""
         if self._playwright is None:
             raise RuntimeError("Playwright 尚未初始化，无法 connect_over_cdp。")
         if not candidate_url:
@@ -1028,6 +1049,7 @@ class AsyncBrowserSession:
         self._cdp_request_header_names = sorted(request_headers.keys())
 
     async def __aenter__(self) -> "AsyncBrowserSession":
+        """进入异步上下文并准备好一个可操作的页面对象。"""
         # LangGraph 的 react agent 在工具调用阶段可能切换 await 点；
         # 这里统一使用 Playwright async API，避免 sync API 被跨线程调用时报 greenlet 错误。
         try:
@@ -1051,7 +1073,7 @@ class AsyncBrowserSession:
                             )
                     self._cdp_connect_error = last_error
                     if self.browser_mode == "connect_over_cdp":
-                        raise RuntimeError(f"连接宿主 Chrome 的 CDP 端点失败：{self._cdp_connect_error}") from None
+                        raise RuntimeError(f"连接本机 Chrome 的 CDP 端点失败：{self._cdp_connect_error}") from None
             if self.browser_mode == "connect_over_cdp":
                 raise RuntimeError("当前浏览器模式要求 connect_over_cdp，但没有提供 CDP URL。")
             executable_path = detect_chromium()
@@ -1093,6 +1115,7 @@ class AsyncBrowserSession:
             raise
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        """退出异步上下文，按所有权安全释放页面、上下文和浏览器。"""
         if self._owns_page and self.page is not None:
             await self.page.close()
         if self._owns_context and self._context is not None:
@@ -1112,11 +1135,17 @@ class AsyncBrowserSession:
 
 
 class PlaywrightToolRuntime:
+    """浏览器工具运行时。
+
+    负责承载具体网站操作逻辑、调试事件、结果落盘，以及给 skill 暴露工具函数。
+    """
+
     def __init__(
         self,
         base_url: str,
         site_password: str = DEFAULT_SITE_PASSWORD,
     ):
+        """初始化一次工具运行时；这里还不绑定具体页面。"""
         self.base_url = base_url.rstrip("/")
         self.site_password = site_password
         self._last_navigation: dict[str, Any] | None = None
@@ -1124,9 +1153,11 @@ class PlaywrightToolRuntime:
         self._debug_events: list[dict[str, Any]] = []
 
     def _start_url(self) -> str:
+        """返回当前运行时的默认起始 URL。"""
         return f"{self.base_url}/"
 
     def _resolve_url(self, current_url: str | None, target: str) -> str:
+        """把相对路径或绝对路径统一解析成可访问 URL。"""
         text = str(target or "").strip()
         if not text:
             return self._start_url()
@@ -1136,6 +1167,7 @@ class PlaywrightToolRuntime:
         return urljoin(base, text)
 
     def _build_run_artifact_dir(self) -> Path:
+        """为本次运行生成独立产物目录。"""
         timestamp = datetime.now().strftime("%H%M%S")
         day_dir = ARTIFACT_DIR / datetime.now().strftime("%Y-%m-%d")
         run_dir = day_dir / f"{timestamp}-{uuid4().hex[:10]}"
@@ -1143,6 +1175,7 @@ class PlaywrightToolRuntime:
         return run_dir
 
     def _push_debug_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """向最近事件列表追加一条调试事件，并控制总长度。"""
         event = {"type": event_type, **payload}
         self._debug_events.append(event)
         if len(self._debug_events) > 12:
@@ -1155,6 +1188,7 @@ class PlaywrightToolRuntime:
         *,
         source: str,
     ) -> dict[str, Any]:
+        """记录一次页面导航结果，保留状态码、关键响应头和最终 URL。"""
         headers: dict[str, Any] = {}
         status: int | None = None
         final_url = page.url
@@ -1193,6 +1227,7 @@ class PlaywrightToolRuntime:
         return meta
 
     async def _settle_page_async(self, page: AsyncPage, extra_wait_ms: int = 500) -> None:
+        """等待页面基本稳定下来，减少后续读取 DOM 时的抖动。"""
         for state, timeout_ms in (("domcontentloaded", 5_000), ("load", 5_000), ("networkidle", 4_000)):
             try:
                 await page.wait_for_load_state(state, timeout=timeout_ms)
@@ -1202,11 +1237,13 @@ class PlaywrightToolRuntime:
             await page.wait_for_timeout(extra_wait_ms)
 
     async def _write_full_html_async(self, page: AsyncPage, output_path: Path) -> str:
+        """把当前页面完整 HTML 写入指定文件。"""
         html = await page.content()
         output_path.write_text(html, encoding="utf-8")
         return html
 
     async def _capture_full_page_screenshot_async(self, page: AsyncPage, output_path: Path) -> str:
+        """对当前页面做整页截图。"""
         await page.screenshot(path=str(output_path), full_page=True)
         return str(output_path)
 
@@ -1217,6 +1254,7 @@ class PlaywrightToolRuntime:
         max_html_chars: int = 4_000,
         max_body_chars: int = 1_200,
     ) -> dict[str, Any]:
+        """诊断当前页面状态，判断是否命中挑战页、空白壳页或验证码弹窗。"""
         dom_probe = await page.evaluate(
             """
             () => {
@@ -1400,6 +1438,7 @@ class PlaywrightToolRuntime:
         return diagnosis
 
     async def _refresh_creditchina_after_captcha_cancel_async(self, page: AsyncPage) -> dict[str, Any]:
+        """在 creditchina 验证码图裂时，尝试取消弹窗并刷新页面恢复。"""
         diagnosis = await self._diagnose_access_async(page)
         if not self._is_creditchina_url(page.url):
             return {"handled": False, "reason": "not_creditchina", "diagnosis": diagnosis}
@@ -1466,6 +1505,7 @@ class PlaywrightToolRuntime:
         broken_grace_ms: int = 8_000,
         max_cancel_refreshes: int = 4,
     ) -> dict[str, Any]:
+        """等待 creditchina 验证码图片真正可用，并在图裂时自动恢复。"""
         wait_budget_ms = max(2_000, min(int(timeout_ms), 60_000))
         poll_budget_ms = max(250, min(int(poll_interval_ms), 2_000))
         broken_grace_budget_ms = max(0, min(int(broken_grace_ms), wait_budget_ms))
@@ -1539,6 +1579,7 @@ class PlaywrightToolRuntime:
         stem: str = "page-debug",
         html_preview_chars: int = 4_000,
     ) -> dict[str, Any]:
+        """保存当前页面 HTML 和整页截图，并返回产物元信息。"""
         stem_name = _sanitize_filename(stem, default_name="page-debug")
         html_path = artifact_dir / f"{stem_name}.html"
         screenshot_path = artifact_dir / f"{stem_name}.png"
@@ -1567,6 +1608,7 @@ class PlaywrightToolRuntime:
         return payload
 
     def export_debug_state(self) -> dict[str, Any]:
+        """导出运行时积累的导航、诊断和事件日志。"""
         return {
             "last_navigation": self._last_navigation,
             "last_access_diagnosis": self._last_access_diagnosis,
@@ -1574,6 +1616,7 @@ class PlaywrightToolRuntime:
         }
 
     def current_session_invalid_state(self) -> tuple[bool, str, dict[str, Any] | None]:
+        """根据最近一次诊断判断当前 session 是否应视为失效。"""
         diagnosis = self._last_access_diagnosis or {}
         headers = diagnosis.get("headers") or {}
         is_invalid = (
@@ -1585,12 +1628,14 @@ class PlaywrightToolRuntime:
         return is_invalid, reason, diagnosis if diagnosis else None
 
     async def _locator_visible_async(self, locator) -> bool:
+        """安全判断一个 Playwright locator 当前是否可见。"""
         try:
             return await locator.first.is_visible(timeout=1500)
         except Exception:
             return False
 
     async def _first_visible_selector_async(self, page: AsyncPage, candidates: list[str]) -> str:
+        """从一组选项中找出第一个当前可见的 selector。"""
         for selector in candidates:
             locator = page.locator(selector)
             try:
@@ -1603,6 +1648,7 @@ class PlaywrightToolRuntime:
         return ""
 
     async def _click_first_visible_async(self, page: AsyncPage, candidates: list[str]) -> str:
+        """点击一组选项里第一个可见元素，并返回命中的 selector。"""
         selector = await self._first_visible_selector_async(page, candidates)
         if not selector:
             raise RuntimeError("没有找到可点击的目标元素。")
@@ -1610,6 +1656,7 @@ class PlaywrightToolRuntime:
         return selector
 
     def _build_creditchina_query_url(self, credit_code: str) -> str:
+        """构造信用中国统一社会信用代码查询页 URL。"""
         encoded = quote(str(credit_code or "").strip())
         return (
             "https://www.creditchina.gov.cn/xinyongxinxi/index.html"
@@ -1624,6 +1671,7 @@ class PlaywrightToolRuntime:
         *,
         fallback_url: str,
     ) -> dict[str, Any]:
+        """把 requests 的 cookie 对象转换成 Playwright cookie 结构。"""
         parsed = urlparse(str(fallback_url or "").strip())
         payload: dict[str, Any] = {
             "name": str(cookie.name),
@@ -1647,10 +1695,12 @@ class PlaywrightToolRuntime:
         return payload
 
     def _is_creditchina_url(self, url: str | None) -> bool:
+        """判断给定 URL 是否属于 creditchina 域名。"""
         host = (urlparse(str(url or "")).hostname or "").strip().lower()
         return host.endswith("creditchina.gov.cn")
 
     def _extract_creditchina_keyword(self, url: str | None) -> str:
+        """从 creditchina URL 的 query 参数里提取 keyword。"""
         parsed = urlparse(str(url or "").strip())
         keyword_values = parse_qs(parsed.query).get("keyword") or []
         if not keyword_values:
@@ -1658,6 +1708,7 @@ class PlaywrightToolRuntime:
         return str(keyword_values[0] or "").strip()
 
     async def _context_cookie_summary_async(self, page: AsyncPage, target_url: str) -> dict[str, Any]:
+        """读取当前 context 在目标 URL 下的 cookie 摘要。"""
         try:
             cookies = await page.context.cookies(target_url)
         except Exception as exc:
@@ -1685,6 +1736,7 @@ class PlaywrightToolRuntime:
         }
 
     async def _storage_summary_async(self, page: AsyncPage) -> dict[str, Any]:
+        """读取页面 localStorage / sessionStorage 的键摘要。"""
         try:
             payload = await page.evaluate(
                 """
@@ -1706,6 +1758,7 @@ class PlaywrightToolRuntime:
         }
 
     async def _creditchina_tracked_requests_async(self, page: AsyncPage) -> list[dict[str, Any]]:
+        """返回页面里追踪到的 creditchina 请求记录。"""
         try:
             payload = await page.evaluate(
                 """
@@ -1742,6 +1795,7 @@ class PlaywrightToolRuntime:
         return tracked_requests[-200:]
 
     def _extract_rcw_from_url(self, url: str | None) -> str:
+        """从 URL 中提取 `rcwCQitg` 参数值。"""
         parsed = urlparse(str(url or "").strip())
         values = parse_qs(parsed.query).get("rcwCQitg") or []
         if not values:
@@ -1749,6 +1803,7 @@ class PlaywrightToolRuntime:
         return str(values[0] or "").strip()
 
     async def _capture_creditchina_runtime_state_async(self, page: AsyncPage) -> dict[str, Any]:
+        """从当前页面 URL 和抓到的请求里提取 creditchina 运行时关键参数。"""
         tracked_requests = await self._creditchina_tracked_requests_async(page)
         private_api_urls: list[str] = []
         rcw_token = ""
@@ -1793,6 +1848,7 @@ class PlaywrightToolRuntime:
         timeout_ms: int = 8_000,
         poll_interval_ms: int = 300,
     ) -> dict[str, Any]:
+        """等待当前页面 / 请求轨迹里出现可用的 `rcwCQitg`。"""
         wait_budget_ms = max(0, min(int(timeout_ms), 20_000))
         poll_budget_ms = max(150, min(int(poll_interval_ms), 1_500))
         elapsed_ms = 0
@@ -1820,6 +1876,7 @@ class PlaywrightToolRuntime:
             elapsed_ms += poll_budget_ms
 
     def _build_creditchina_private_api_url(self, endpoint: str, rcw_token: str, extra_query: dict[str, Any] | None = None) -> str:
+        """拼出带 `rcwCQitg` 的 creditchina private-api 完整 URL。"""
         normalized_endpoint = str(endpoint or "").strip()
         if not normalized_endpoint.startswith("/"):
             normalized_endpoint = f"/{normalized_endpoint}"
@@ -1843,6 +1900,7 @@ class PlaywrightToolRuntime:
         body: str | None = None,
         response_kind: str = "text",
     ) -> dict[str, Any]:
+        """在页面上下文里发起 fetch，请求时天然复用浏览器会话。"""
         payload = await page.evaluate(
             """
             async ({ url, method, headers, body, responseKind }) => {
@@ -1901,6 +1959,7 @@ class PlaywrightToolRuntime:
         body: str | None = None,
         extra_query: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """在浏览器上下文里请求 creditchina JSON 接口并解析响应。"""
         url = self._build_creditchina_private_api_url(endpoint, rcw_token, extra_query=extra_query)
         default_headers = {"Accept": "application/json, text/javascript, */*; q=0.01"}
         if method.upper() == "POST":
@@ -1936,6 +1995,7 @@ class PlaywrightToolRuntime:
         }
 
     async def _creditchina_api_get_verify_async(self, page: AsyncPage, *, rcw_token: str) -> dict[str, Any]:
+        """请求 creditchina private-api 的验证码图片接口。"""
         response_payload = await self._creditchina_browser_fetch_async(
             page,
             url=self._build_creditchina_private_api_url("verify/getVerify", rcw_token, extra_query={"_v": f"{datetime.now().timestamp():.6f}"}),
@@ -1968,6 +2028,7 @@ class PlaywrightToolRuntime:
         rcw_token: str,
         verify_input: str,
     ) -> dict[str, Any]:
+        """调用验证码校验接口，判断 OCR 结果是否通过。"""
         verify_code = str(verify_input or "").strip().upper()
         payload = await self._creditchina_api_json_request_async(
             page,
@@ -1992,6 +2053,7 @@ class PlaywrightToolRuntime:
         max_attempts: int,
         file_prefix: str,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """执行一轮 private-api 验证码校验流程，直到成功或重试耗尽。"""
         verify_attempts: list[dict[str, Any]] = []
         verify_success_payload: dict[str, Any] | None = None
         captcha_limit = max(1, min(int(max_attempts), 8))
@@ -2045,6 +2107,7 @@ class PlaywrightToolRuntime:
         return verify_success_payload, verify_attempts
 
     def _creditchina_detail_requires_reverify(self, detail_json: dict[str, Any] | None) -> bool:
+        """判断详情接口是否提示验证码失效，需要重新校验。"""
         payload = dict(detail_json or {})
         status = int(payload.get("status") or 0)
         message = str(payload.get("message") or "")
@@ -2056,6 +2119,7 @@ class PlaywrightToolRuntime:
         *,
         credit_code: str,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """从搜索候选里优先挑出统一社会信用代码精确匹配的主体。"""
         normalized_credit_code = str(credit_code or "").strip().upper()
         normalized_candidates = [dict(item) for item in candidates if isinstance(item, dict)]
         for candidate in normalized_candidates:
@@ -2067,6 +2131,7 @@ class PlaywrightToolRuntime:
         return None, normalized_candidates
 
     def _build_creditchina_detail_url(self, candidate: dict[str, Any]) -> str:
+        """根据搜索候选拼出 creditchina 详情页 URL。"""
         entity_type = str(candidate.get("entityType") or "1").strip() or "1"
         keyword = quote(str(candidate.get("accurate_entity_name_query") or candidate.get("accurate_entity_name") or "").strip())
         uuid_value = quote(str(candidate.get("uuid") or "").strip())
@@ -2082,6 +2147,7 @@ class PlaywrightToolRuntime:
         *,
         credit_code: str,
     ) -> dict[str, Any]:
+        """根据当前运行时状态组装 catalogSearchHome 查询参数。"""
         state = dict(runtime_state or {})
         normalized_credit_code = str(credit_code or "").strip().upper()
         return {
@@ -2094,6 +2160,7 @@ class PlaywrightToolRuntime:
         }
 
     def _build_creditchina_detail_api_query(self, runtime_state: dict[str, Any] | None) -> dict[str, Any]:
+        """根据当前运行时状态组装详情接口查询参数。"""
         state = dict(runtime_state or {})
         extra_query: dict[str, Any] = {}
         for key, state_key in (
@@ -2116,6 +2183,7 @@ class PlaywrightToolRuntime:
         selected_candidate: dict[str, Any] | None,
         detail_payload: dict[str, Any],
     ) -> dict[str, Any]:
+        """把 API 返回整理成统一的业务字段结构。"""
         detail_data = dict(detail_payload.get("data") or {})
         basic_section = dict(detail_data.get("data") or {})
         basic_entity = dict(basic_section.get("entity") or {})
@@ -2153,6 +2221,7 @@ class PlaywrightToolRuntime:
         candidate: dict[str, Any] | None,
         body_text: str,
     ) -> dict[str, Any]:
+        """把 DOM 提取结果规整成与 API 结果同构的格式。"""
         selected_candidate = dict(candidate or {})
         normalized_credit_code = (
             str(selected_candidate.get("accurate_entity_code") or credit_code or "").strip().upper()
@@ -2190,12 +2259,44 @@ class PlaywrightToolRuntime:
             },
         }
 
+    def _extract_creditchina_result_fields(self, result: dict[str, Any] | None) -> dict[str, Any]:
+        """从不同形态的 creditchina 结果中取出 normalized 字段集合。"""
+        if not isinstance(result, dict):
+            return {}
+        normalized_payload = result.get("normalized")
+        if not isinstance(normalized_payload, dict):
+            return {}
+        normalized = normalized_payload.get("normalized")
+        if isinstance(normalized, dict):
+            return normalized
+        return normalized_payload
+
+    def _creditchina_dom_result_is_final(self, result: dict[str, Any] | None, *, current_url: str = "") -> bool:
+        """判断当前 DOM 结果是否已经足够视为最终完整结果。"""
+        fields = self._extract_creditchina_result_fields(result)
+        if not fields:
+            return False
+        normalized_url = str(current_url or "").strip().lower()
+        if "/xinyongxinxixiangqing/xydetail.html" in normalized_url:
+            return True
+        return any(
+            str(fields.get(key) or "").strip()
+            for key in (
+                "status",
+                "legal_person",
+                "establish_date",
+                "address",
+                "registration_authority",
+            )
+        )
+
     async def _extract_creditchina_dom_result_async(
         self,
         page: AsyncPage,
         *,
         credit_code: str = "",
     ) -> dict[str, Any]:
+        """从 creditchina 页面 DOM 中抽取企业候选与结构化结果。"""
         expected_credit_code = str(credit_code or self._extract_creditchina_keyword(page.url)).strip().upper()
         search_keyword = expected_credit_code or str(self._extract_creditchina_keyword(page.url)).strip()
         try:
@@ -2308,6 +2409,7 @@ class PlaywrightToolRuntime:
         timeout_ms: int = 6_000,
         poll_interval_ms: int = 400,
     ) -> dict[str, Any]:
+        """等待 creditchina 挑战页生成必要的 JS cookie / storage 状态。"""
         wait_budget_ms = max(0, min(int(timeout_ms), 20_000))
         poll_budget_ms = max(150, min(int(poll_interval_ms), 1_500))
         elapsed_ms = 0
@@ -2342,6 +2444,7 @@ class PlaywrightToolRuntime:
             elapsed_ms += poll_budget_ms
 
     def _warm_creditchina_cookie_candidates_sync(self, targets: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """在同步线程里预热多个 creditchina 页面，收集 cookie 候选。"""
         session = requests.Session()
         session.headers.update(
             {
@@ -2417,6 +2520,7 @@ class PlaywrightToolRuntime:
         *,
         credit_code: str,
     ) -> dict[str, Any]:
+        """用 requests 预热 cookie，再把结果注入当前浏览器上下文。"""
         home_url = "https://www.creditchina.gov.cn/"
         query_url = self._build_creditchina_query_url(credit_code)
         targets = [home_url, query_url]
@@ -2464,6 +2568,7 @@ class PlaywrightToolRuntime:
         max_retries: int = 2,
         capture_artifacts: bool = True,
     ) -> dict[str, Any]:
+        """尝试让 creditchina 从挑战状态恢复到可查询状态。"""
         home_url = "https://www.creditchina.gov.cn/"
         resolved_target_url = str(target_url or "").strip() or home_url
         wait_budget_ms = max(500, min(int(float(wait_seconds) * 1000), 20_000))
@@ -2552,6 +2657,7 @@ class PlaywrightToolRuntime:
         return payload
 
     def _build_result_output_stem(self, credit_code: str, base_name: str = "") -> str:
+        """为本次 creditchina 落盘结果生成统一文件名前缀。"""
         if str(base_name or "").strip():
             stem_base = _sanitize_filename(base_name, default_name="creditchina-result")
         else:
@@ -2573,6 +2679,7 @@ class PlaywrightToolRuntime:
         result_payload: dict[str, Any] | None = None,
         text_payload: str = "",
     ) -> dict[str, Any]:
+        """把一次查询结果统一写成 json / txt，并附带 html / png 快照。"""
         stem = self._build_result_output_stem(credit_code, base_name=base_name)
         artifact_dir.mkdir(parents=True, exist_ok=True)
         result_json_path = artifact_dir / f"{stem}.json"
@@ -2626,6 +2733,7 @@ class PlaywrightToolRuntime:
         *,
         credit_code: str,
     ) -> dict[str, Any]:
+        """把页面推进到 creditchina 可查询状态，为 API 或 DOM 流做准备。"""
         home_url = "https://www.creditchina.gov.cn/"
         query_url = self._build_creditchina_query_url(credit_code)
         steps: list[dict[str, Any]] = []
@@ -2728,6 +2836,7 @@ class PlaywrightToolRuntime:
         credit_code: str,
         max_captcha_attempts: int = 6,
     ) -> dict[str, Any]:
+        """执行 creditchina private-api 主链路。"""
         normalized_credit_code = str(credit_code or "").strip().upper()
         seed_state = await self._wait_for_creditchina_rcw_async(page, timeout_ms=8_000)
         runtime_state = dict(seed_state.get("runtime_state") or {})
@@ -2929,6 +3038,7 @@ class PlaywrightToolRuntime:
         credit_code: str = "",
         max_attempts: int = 6,
     ) -> dict[str, Any]:
+        """处理页面式验证码流程，直到进入结果页或确认失败。"""
         existing_result = await self._detect_creditchina_result_ready_async(page, credit_code=credit_code)
         if existing_result.get("ok"):
             return {
@@ -3040,6 +3150,7 @@ class PlaywrightToolRuntime:
         max_retries: int = 2,
         capture_artifacts: bool = True,
     ) -> dict[str, Any]:
+        """在挑战页或空白页场景下做等待、重载和状态续跑。"""
         attempts: list[dict[str, Any]] = []
         diagnosis = await self._diagnose_access_async(page)
         attempts.append({"step": 0, "diagnosis": diagnosis})
@@ -3119,6 +3230,7 @@ class PlaywrightToolRuntime:
         return payload
 
     async def _try_read_result_json_async(self, page: AsyncPage) -> dict[str, Any] | None:
+        """尝试读取页面内 `#result-json` 的内容。"""
         result_locator = page.locator("#result-json")
         if await result_locator.count() == 0:
             return None
@@ -3140,6 +3252,7 @@ class PlaywrightToolRuntime:
         *,
         credit_code: str = "",
     ) -> dict[str, Any]:
+        """判断当前页面是否已经具备可提取的 creditchina 查询结果。"""
         page_result = await self._extract_creditchina_dom_result_async(page, credit_code=credit_code)
         return {
             "ok": bool(page_result.get("ok")),
@@ -3158,6 +3271,7 @@ class PlaywrightToolRuntime:
         timeout_ms: int = 8_000,
         poll_interval_ms: int = 2_000,
     ) -> dict[str, Any]:
+        """轮询等待 DOM 结果页真正就绪。"""
         wait_budget_ms = max(0, min(int(timeout_ms), 20_000))
         poll_budget_ms = max(500, min(int(poll_interval_ms), 3_000))
         elapsed_ms = 0
@@ -3188,6 +3302,7 @@ class PlaywrightToolRuntime:
     async def _captcha_error_present_async(
         self, page: AsyncPage, error_keyword: str = "验证码错误"
     ) -> tuple[bool, str]:
+        """检查页面里是否出现验证码错误提示。"""
         try:
             body_text = await page.locator("body").first.inner_text(timeout=2000) or ""
         except Exception:
@@ -3207,6 +3322,7 @@ class PlaywrightToolRuntime:
         error_keyword: str = "验证码错误",
         max_attempts: int = 6,
     ) -> dict[str, Any]:
+        """通用验证码循环：截图、识别、提交、检查结果。"""
         attempts: list[dict[str, Any]] = []
         attempt_limit = max(1, min(int(max_attempts), 10))
 
@@ -3274,6 +3390,7 @@ class PlaywrightToolRuntime:
         max_captcha_attempts: int = 6,
         save_failure_result: bool = True,
     ) -> dict[str, Any]:
+        """执行 private-api 版 creditchina 查询并统一落盘。"""
         normalized_credit_code = str(credit_code or "").strip()
         if not normalized_credit_code:
             raise RuntimeError("统一社会信用代码不能为空。")
@@ -3285,7 +3402,7 @@ class PlaywrightToolRuntime:
             poll_interval_ms=2_000,
         )
         current_page_result = dict(current_page_result_wait.get("result") or {})
-        if current_page_result.get("ok"):
+        if current_page_result.get("ok") and self._creditchina_dom_result_is_final(current_page_result, current_url=page.url):
             text_payload = json.dumps(current_page_result.get("normalized") or current_page_result, ensure_ascii=False, indent=2)
             saved_result = await self._write_creditchina_result_files_async(
                 page,
@@ -3326,7 +3443,7 @@ class PlaywrightToolRuntime:
             poll_interval_ms=2_000,
         )
         existing_result = dict(existing_result_wait.get("result") or {})
-        if existing_result.get("ok"):
+        if existing_result.get("ok") and self._creditchina_dom_result_is_final(existing_result, current_url=page.url):
             text_payload = json.dumps(existing_result.get("normalized") or existing_result, ensure_ascii=False, indent=2)
             saved_result = await self._write_creditchina_result_files_async(
                 page,
@@ -3368,7 +3485,7 @@ class PlaywrightToolRuntime:
                 poll_interval_ms=2_000,
             )
             existing_result = dict(existing_result_wait.get("result") or {})
-            if existing_result.get("ok"):
+            if existing_result.get("ok") and self._creditchina_dom_result_is_final(existing_result, current_url=page.url):
                 text_payload = json.dumps(existing_result.get("normalized") or existing_result, ensure_ascii=False, indent=2)
                 saved_result = await self._write_creditchina_result_files_async(
                     page,
@@ -3474,6 +3591,7 @@ class PlaywrightToolRuntime:
         result_name: str = "",
         max_captcha_attempts: int = 6,
     ) -> dict[str, Any]:
+        """执行标准 creditchina 查询：先 API，失败再回退 DOM，并统一落盘。"""
         normalized_credit_code = str(credit_code or "").strip()
         if not normalized_credit_code:
             raise RuntimeError("统一社会信用代码不能为空。")
@@ -3738,6 +3856,7 @@ class PlaywrightToolRuntime:
         }
 
     def build_async_tools(self, page: AsyncPage, artifact_dir: Path) -> list[Any]:
+        """构造给 browser_react skill 暴露的一整套异步浏览器工具。"""
         @tool
         async def open_start_page() -> str:
             """打开配置好的起始页面。适合每次任务刚开始时调用。"""
@@ -3989,23 +4108,6 @@ class PlaywrightToolRuntime:
             return json.dumps(payload, ensure_ascii=False)
 
         @tool
-        async def run_creditchina_private_api_query_and_save(
-            credit_code: str,
-            result_name: str = "",
-            max_captcha_attempts: int = 6,
-        ) -> str:
-            """执行“信用中国”private-api 查询流程：挑战续跑、验证码 API、搜索结果 API、详情 API，并把最终结果保存到文件。"""
-            payload = await self.run_creditchina_private_api_flow_and_save_async(
-                page,
-                artifact_dir,
-                credit_code=credit_code,
-                result_name=result_name,
-                max_captcha_attempts=max_captcha_attempts,
-                save_failure_result=True,
-            )
-            return json.dumps(payload, ensure_ascii=False)
-
-        @tool
         async def run_creditchina_query_and_save(
             credit_code: str,
             result_name: str = "",
@@ -4104,7 +4206,6 @@ class PlaywrightToolRuntime:
             capture_page_artifacts,
             detect_access_challenge,
             retry_on_access_challenge,
-            run_creditchina_private_api_query_and_save,
             run_creditchina_query_and_save,
             fill_input,
             click_element,

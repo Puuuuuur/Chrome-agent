@@ -1,8 +1,13 @@
+"""内置聊天页面渲染器。
+
+这个文件只负责把后端运行状态和聊天前端拼成一个可直接打开的 HTML 页面。
+"""
+
 from __future__ import annotations
 
 import json
 
-from agent工具 import playwright_agent_is_ready, runtime_metadata
+from tools.tool_browser_runtime import playwright_agent_is_ready, runtime_metadata
 from 智能体调度 import (
     DEFAULT_API_BASE_URL,
     DEFAULT_BASE_URL,
@@ -14,14 +19,17 @@ from 智能体调度 import (
     DEFAULT_MODEL,
     DEFAULT_SITE_PASSWORD,
     WELCOME_MESSAGE,
+    invoke_agent_skill,
     invoke_creditchina_query,
     invoke_playwright_agent,
+    list_registered_skills,
 )
 
 # 这个文件只负责页面渲染。
-# 真正的单 agent 调度与工具调用都在 `智能体调度.py`。
+# 真正的 skill 分发与执行入口都在 `智能体调度.py` / `skills/`。
 
 __all__ = [
+    "invoke_agent_skill",
     "invoke_creditchina_query",
     "invoke_playwright_agent",
     "playwright_agent_is_ready",
@@ -31,6 +39,7 @@ __all__ = [
 
 
 def render_playwright_agent_page(embedded: bool = False) -> str:
+    """渲染浏览器 Agent 的内置聊天页面。"""
     ready, ready_error = playwright_agent_is_ready()
     metadata = runtime_metadata()
     config_json = json.dumps(
@@ -56,13 +65,11 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
             "defaultInvalidMarkerPath": "",
             "sessionDir": metadata.get("session_dir") or "",
             "welcomeMessage": WELCOME_MESSAGE,
+            "availableSkills": list_registered_skills(),
         },
         ensure_ascii=False,
     ).replace("</", "<\\/")
     body_class = "embedded" if embedded else "standalone"
-    ready_copy = "已就绪" if ready else "未就绪"
-    ready_class = "ready" if ready else "not-ready"
-
     return f"""<!doctype html>
 <html lang='zh-CN'>
 <head>
@@ -128,85 +135,32 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       overflow: hidden;
       background: var(--panel-strong);
       display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
-    }}
-
-    .topbar {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 18px;
-      border-bottom: 1px solid rgba(36, 44, 55, 0.08);
-      background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(247, 245, 240, 0.88));
-    }}
-
-    .topbar-title {{
-      display: grid;
-      gap: 4px;
-      min-width: 0;
-    }}
-
-    .eyebrow {{
-      font-size: 12px;
-      line-height: 1.4;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--accent);
-      font-weight: 700;
-    }}
-
-    .title {{
-      font-size: 18px;
-      line-height: 1.4;
-      font-weight: 700;
-      color: var(--text);
-    }}
-
-    .subtitle {{
-      font-size: 13px;
-      line-height: 1.5;
-      color: var(--muted);
-    }}
-
-    .status-chip {{
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 34px;
-      padding: 6px 12px;
-      border-radius: 999px;
-      font-size: 13px;
-      line-height: 1.4;
-      font-weight: 700;
-      width: fit-content;
-      white-space: nowrap;
-      flex-shrink: 0;
-    }}
-
-    .status-chip.ready {{
-      background: var(--ok-soft);
-      color: var(--ok);
-      border: 1px solid rgba(31, 143, 99, 0.14);
-    }}
-
-    .status-chip.not-ready {{
-      background: var(--danger-soft);
-      color: var(--danger);
-      border: 1px solid rgba(180, 35, 24, 0.14);
+      grid-template-rows: minmax(0, 1fr) auto auto;
     }}
 
     .chat-feed {{
-      padding: 28px 20px 20px;
+      padding: 20px 20px 20px;
       display: grid;
       align-content: start;
       gap: 16px;
       min-height: 0;
       overflow: auto;
+      overscroll-behavior-y: contain;
+      -webkit-overflow-scrolling: touch;
+      touch-action: pan-y;
       background:
         radial-gradient(520px 240px at 100% 0%, rgba(67, 88, 106, 0.05), transparent 58%),
         linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(249, 247, 243, 0.72));
+    }}
+
+    .page.empty-state .chat-feed {{
+      align-content: end;
+      padding-top: 20px;
+      padding-bottom: 12px;
+    }}
+
+    .page.empty-state .message.assistant {{
+      max-width: min(96%, 1120px);
     }}
 
     .message {{
@@ -418,13 +372,8 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
     }}
 
     @media (max-width: 820px) {{
-      .topbar {{
-        padding: 12px 14px;
-        align-items: flex-start;
-      }}
-
       .chat-feed {{
-        padding: 20px 14px 16px;
+        padding: 16px 14px 16px;
       }}
 
       .typing {{
@@ -443,15 +392,6 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
 </head>
 <body class='{body_class}'>
   <div class='page'>
-    <section class='topbar'>
-      <div class='topbar-title'>
-        <div class='eyebrow'>法务测试 / 浏览器 Agent</div>
-        <div class='title'>Playwright 对话面板</div>
-        <div class='subtitle'>这里只保留聊天入口；需要时会自动调用 Playwright 工具，并可处理空白页/挑战页诊断。</div>
-      </div>
-      <div class='status-chip {ready_class}'>{ready_copy}</div>
-    </section>
-
     <section id='messages' class='chat-feed'></section>
     <div id='typing' class='typing' hidden>
       <span class='typing-dot'></span>
@@ -463,8 +403,7 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
     <form id='composer-form' class='composer'>
       <div class='composer-box'>
         <div class='prompt-row'>
-          <button type='button' class='prompt-chip' data-prompt='帮我完成一次完整的信用查询，并告诉我企业名称。'>跑完整查询</button>
-          <button type='button' class='prompt-chip' data-prompt='进入 https://www.creditchina.gov.cn/ ，输入统一社会信用代码 91420000177570439L，点击搜索，处理图形验证码，并把最终信用信息查询结果保存到文件。'>信用中国固定查询</button>
+          <button type='button' class='prompt-chip' data-prompt='进入 https://www.creditchina.gov.cn/ ，使用统一社会信用代码 91420000177570439L 完成一次完整的信用中国固定查询，并把最终结果保存到文件。要求：1. 不能把搜索结果列表页当成最终完成；如果当前只是列表页命中结果，继续进入企业详情页。2. 只有拿到详情页字段或 private-api 详情字段后，才算查询完成。3. 如果 private-api 和详情页都失败，才允许回退成列表页简版结果，并明确告诉我这是回退结果。4. 最终请告诉我企业名称、统一社会信用代码、法定代表人/负责人、成立日期、住所、登记机关，以及结果文件路径。'>跑完整查询 / 信用中国固定查询</button>
           <button type='button' class='prompt-chip' data-prompt='先观察当前页面，列出主要输入框、按钮、图片和它们的 selector。'>看页面 selector</button>
           <button type='button' class='prompt-chip' data-prompt='如果页面结构变了，请你自己重新观察 DOM，再规划下一步操作。'>让它自己规划</button>
           <button type='button' class='prompt-chip' data-prompt='如果页面是空白页或可见元素为空，请继续等待、判断是否是挑战页，并保存完整 HTML 和整页截图给我。'>排查空白页</button>
@@ -480,12 +419,21 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
 
   <script>
     const pageConfig = {config_json};
+    const SESSION_STORAGE_KEY = 'playwright-agent-session-id';
+    const pageEl = document.querySelector('.page');
     const messagesEl = document.getElementById('messages');
     const typingEl = document.getElementById('typing');
     const composerForm = document.getElementById('composer-form');
     const composerInput = document.getElementById('composer-input');
     const sendBtn = document.getElementById('send-btn');
     let inFlight = false;
+    let sessionId = '';
+
+    try {{
+      sessionId = String(window.localStorage.getItem(SESSION_STORAGE_KEY) || '').trim();
+    }} catch (_error) {{
+      sessionId = '';
+    }}
 
     function escapeHtml(value) {{
       return String(value || '')
@@ -506,13 +454,18 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       wrapper.appendChild(bubble);
 
       if (meta && role === 'assistant') {{
+        const selectedSkill = meta.skill && meta.skill.name ? String(meta.skill.name) : '';
         const usedTools = Array.isArray(meta.used_tools) ? meta.used_tools : [];
-        if (usedTools.length) {{
+        if (selectedSkill || usedTools.length) {{
           const toolRow = document.createElement('div');
           toolRow.className = 'tool-row';
-          toolRow.innerHTML = usedTools.map((item) => (
+          const chips = [];
+          if (selectedSkill) {{
+            chips.push("<span class='tool-chip'>skill:" + escapeHtml(selectedSkill) + "</span>");
+          }}
+          toolRow.innerHTML = chips.concat(usedTools.map((item) => (
             "<span class='tool-chip'>" + escapeHtml(item) + "</span>"
-          )).join('');
+          ))).join('');
           wrapper.appendChild(toolRow);
         }}
         if (meta.page_result || meta.agent_debug) {{
@@ -521,7 +474,21 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       }}
 
       messagesEl.appendChild(wrapper);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      syncEmptyState();
+      scrollMessagesToBottom();
+    }}
+
+    function syncEmptyState() {{
+      const messageCount = messagesEl.querySelectorAll('.message').length;
+      const hasUserMessage = Boolean(messagesEl.querySelector('.message.user'));
+      const isEmptyState = !inFlight && messageCount <= 1 && !hasUserMessage;
+      pageEl.classList.toggle('empty-state', isEmptyState);
+    }}
+
+    function scrollMessagesToBottom() {{
+      window.requestAnimationFrame(() => {{
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }});
     }}
 
     function syncComposerHeight() {{
@@ -535,6 +502,8 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       composerInput.disabled = inFlight || !pageConfig.ready;
       sendBtn.disabled = inFlight || !pageConfig.ready;
       typingEl.hidden = !inFlight;
+      syncEmptyState();
+      scrollMessagesToBottom();
     }}
 
     function buildChatApiUrl() {{
@@ -570,11 +539,11 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
             'Accept': 'application/json',
           }},
           body: JSON.stringify({{
+            session_id: sessionId,
             message: text,
             base_url: String(pageConfig.defaultBaseUrl || '').trim(),
             credit_code: String(pageConfig.defaultCreditCode || '').trim(),
             site_password: String(pageConfig.defaultSitePassword || '').trim(),
-            mode: 'react',
             model: String(pageConfig.defaultModel || '').trim(),
             api_base_url: String(pageConfig.defaultApiBaseUrl || '').trim(),
             max_steps: Number(pageConfig.defaultMaxSteps || 30),
@@ -604,6 +573,14 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
         }}
 
         const result = payload.result || {{}};
+        const nextSessionId = String(((result.session || {{}}).id) || '').trim();
+        if (nextSessionId) {{
+          sessionId = nextSessionId;
+          try {{
+            window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+          }} catch (_error) {{
+          }}
+        }}
         appendMessage('assistant', String(result.reply || '已完成，但没有返回文字总结。'), result);
       }} catch (error) {{
         appendMessage('assistant', '这次调用失败了：' + String(error && error.message ? error.message : error), null);
@@ -645,7 +622,10 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
 
     setBusy(false);
     syncComposerHeight();
+    syncEmptyState();
+    scrollMessagesToBottom();
     composerInput.focus();
+    window.addEventListener('resize', scrollMessagesToBottom);
   </script>
 </body>
 </html>"""

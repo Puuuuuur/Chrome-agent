@@ -1,9 +1,15 @@
+"""浏览器 Agent 的集中配置文件。
+
+这个文件负责把环境变量转换成稳定的默认值，避免各模块到处散落配置读取逻辑。
+"""
+
 from __future__ import annotations
 
 import os
 import platform
 import re
 from pathlib import Path
+from urllib.parse import quote_plus
 from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = (
@@ -43,7 +49,65 @@ DEFAULT_API_BASE_URL = (
 DEFAULT_MAX_STEPS = max(6, int(os.getenv("PLAYWRIGHT_AGENT_MAX_STEPS", "30")))
 
 
+def _build_chat_memory_postgres_dsn() -> str:
+    """构造聊天记忆使用的 PostgreSQL DSN。"""
+    explicit = str(
+        os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_DSN")
+        or os.getenv("PLAYWRIGHT_AGENT_MEMORY_POSTGRES_DSN")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+
+    host = str(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_HOST") or "").strip()
+    database = str(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_DB") or "").strip()
+    user = str(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_USER") or "").strip()
+    password = str(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_PASSWORD") or "")
+    port = str(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_PORT") or "5432").strip() or "5432"
+    sslmode = str(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_SSLMODE") or "prefer").strip() or "prefer"
+    if not host or not database or not user:
+        return ""
+    return (
+        "postgresql://"
+        f"{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{quote_plus(database)}"
+        f"?sslmode={quote_plus(sslmode)}"
+    )
+
+
+CHAT_MEMORY_ENABLED = (
+    str(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_ENABLED", "1")).strip().lower()
+    not in {"0", "false", "off", "no"}
+)
+
+CHAT_MEMORY_POSTGRES_DSN = _build_chat_memory_postgres_dsn()
+CHAT_MEMORY_POSTGRES_CONNECT_TIMEOUT = max(
+    1,
+    int(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_POSTGRES_CONNECT_TIMEOUT", "5")),
+)
+
+CHAT_MEMORY_RECENT_MESSAGES_LIMIT = max(
+    2,
+    int(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_RECENT_MESSAGES_LIMIT", "8")),
+)
+CHAT_MEMORY_SUMMARY_TRIGGER_MESSAGES = max(
+    CHAT_MEMORY_RECENT_MESSAGES_LIMIT + 2,
+    int(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_SUMMARY_TRIGGER_MESSAGES", "12")),
+)
+CHAT_MEMORY_SUMMARY_KEEP_RECENT_MESSAGES = max(
+    2,
+    int(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_SUMMARY_KEEP_RECENT_MESSAGES", "6")),
+)
+CHAT_MEMORY_SUMMARY_MODEL = (
+    os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_SUMMARY_MODEL")
+    or DEFAULT_MODEL
+).strip() or DEFAULT_MODEL
+CHAT_MEMORY_SUMMARY_MAX_CHARS = max(
+    600,
+    int(os.getenv("PLAYWRIGHT_AGENT_CHAT_MEMORY_SUMMARY_MAX_CHARS", "2200")),
+)
+
 def _read_bool_env(*names: str, default: bool) -> bool:
+    """按顺序读取多个布尔环境变量，返回第一个命中的值。"""
     for name in names:
         raw_value = os.getenv(name)
         if raw_value is None:
@@ -52,16 +116,8 @@ def _read_bool_env(*names: str, default: bool) -> bool:
     return bool(default)
 
 
-def normalize_deployment_mode(raw_value: str | None) -> str:
-    value = str(raw_value or "").strip().lower()
-    if value in {"host", "local", "local-host", "host-local"}:
-        return "host"
-    if value in {"container", "docker", "sandbox"}:
-        return "container"
-    return "auto"
-
-
 def normalize_browser_mode(raw_value: str | None) -> str:
+    """把浏览器模式统一规范成内部使用的固定枚举值。"""
     value = str(raw_value or "").strip().lower()
     if value in {"", "auto", "cdp-or-launch", "connect-over-cdp-or-launch"}:
         return "connect_over_cdp_or_launch"
@@ -84,14 +140,8 @@ DEFAULT_BROWSER_EXECUTABLE = (
     or ""
 ).strip()
 
-DEFAULT_DEPLOYMENT_MODE = normalize_deployment_mode(
-    os.getenv("PLAYWRIGHT_AGENT_DEPLOYMENT_MODE")
-    or os.getenv("PU_PLAYWRIGHT_AGENT_DEPLOYMENT_MODE")
-    or "auto"
-)
-
-
 def _resolve_default_cdp_url() -> str:
+    """推断默认的本机 CDP 地址。"""
     explicit = (
         os.getenv("PLAYWRIGHT_AGENT_CDP_URL")
         or os.getenv("PU_PLAYWRIGHT_AGENT_CDP_URL")
@@ -101,9 +151,7 @@ def _resolve_default_cdp_url() -> str:
         return explicit
     if platform.system() == "Darwin":
         return "http://127.0.0.1:9222"
-    if DEFAULT_DEPLOYMENT_MODE == "container":
-        return "http://host.docker.internal:9222"
-    # Linux 宿主部署默认优先直连本机浏览器，避免先绕容器边界。
+    # Linux 直接运行时默认优先直连本机浏览器。
     return "http://127.0.0.1:9222"
 
 
@@ -182,6 +230,41 @@ ARTIFACT_DIR = Path(
     or str(TASK_OUTPUT_ROOT)
 ).expanduser()
 
+RAG_ENABLED = (
+    str(os.getenv("PLAYWRIGHT_AGENT_RAG_ENABLED", "1")).strip().lower()
+    not in {"0", "false", "off", "no"}
+)
+RAG_SOURCE_DIR = Path(
+    (
+        os.getenv("PLAYWRIGHT_AGENT_RAG_SOURCE_DIR")
+        or str(PROJECT_DIR / "rag_store" / "source_pdfs")
+    ).strip()
+    or str(PROJECT_DIR / "rag_store" / "source_pdfs")
+).expanduser()
+RAG_MILVUS_URI = (
+    os.getenv("PLAYWRIGHT_AGENT_RAG_MILVUS_URI")
+    or str(Path.home() / ".playwright-agent-memory" / "rag_knowledge_milvus.db")
+).strip() or str(Path.home() / ".playwright-agent-memory" / "rag_knowledge_milvus.db")
+RAG_MILVUS_COLLECTION = (
+    os.getenv("PLAYWRIGHT_AGENT_RAG_MILVUS_COLLECTION")
+    or "playwright_agent_rag_knowledge"
+).strip() or "playwright_agent_rag_knowledge"
+RAG_TOP_K = max(1, int(os.getenv("PLAYWRIGHT_AGENT_RAG_TOP_K", "3")))
+RAG_CHUNK_SIZE = max(80, int(os.getenv("PLAYWRIGHT_AGENT_RAG_CHUNK_SIZE", "320")))
+RAG_CHUNK_OVERLAP = max(0, int(os.getenv("PLAYWRIGHT_AGENT_RAG_CHUNK_OVERLAP", "60")))
+RAG_EMBEDDING_PROVIDER = (
+    os.getenv("PLAYWRIGHT_AGENT_RAG_EMBEDDING_PROVIDER")
+    or "openai"
+).strip().lower() or "openai"
+RAG_EMBEDDING_MODEL = (
+    os.getenv("PLAYWRIGHT_AGENT_RAG_EMBEDDING_MODEL")
+    or "text-embedding-3-small"
+).strip() or "text-embedding-3-small"
+RAG_EMBEDDING_DIMENSION = max(
+    32,
+    int(os.getenv("PLAYWRIGHT_AGENT_RAG_EMBEDDING_DIMENSION", "1536")),
+)
+
 WELCOME_MESSAGE = (
     "你好，我是统一的 Playwright 测试智能体。平时可以正常聊天；"
     "当你需要看页面 DOM、找 selector 或跑法务测试流程时，我会自己调用页面工具。"
@@ -195,6 +278,7 @@ def build_session_file_paths(
     *,
     session_dir: Path | None = None,
 ) -> dict[str, Path]:
+    """根据目标站点域名，生成该站点对应的会话文件路径集合。"""
     target_dir = Path(session_dir or SESSION_DIR).expanduser()
     parsed = urlparse(str(base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL)
     host = (parsed.hostname or "default").strip().lower() or "default"

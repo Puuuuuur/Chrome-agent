@@ -1,3 +1,10 @@
+"""模型客户端辅助工具模块。
+
+这里专门负责：
+- 找到 OpenAI API Key
+- 构造统一的 OpenAI client
+"""
+
 from __future__ import annotations
 
 import json
@@ -15,6 +22,7 @@ __all__ = [
 
 
 def _candidate_auth_paths() -> list[Path]:
+    """给 API Key 搜索候选认证文件路径。"""
     candidates = [
         Path.home() / ".codex" / "auth.json",
         Path("/root/.codex/auth.json"),
@@ -28,6 +36,7 @@ def _candidate_auth_paths() -> list[Path]:
 
 
 def load_agent_api_key() -> str:
+    """读取浏览器 Agent 运行所需的 OpenAI API Key。"""
     api_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
     if api_key:
         return api_key
@@ -52,6 +61,7 @@ def load_agent_api_key() -> str:
 
 
 def build_openai_client(base_url: str | None = None) -> OpenAI:
+    """构造一个已经带好 base_url 和 api_key 的 OpenAI 客户端。"""
     resolved_base_url = str(base_url or DEFAULT_API_BASE_URL).strip().rstrip("/") or DEFAULT_API_BASE_URL
     return OpenAI(
         api_key=load_agent_api_key(),

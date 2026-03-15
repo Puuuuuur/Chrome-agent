@@ -7,3 +7,6 @@ langchain==1.2.10
 langgraph==1.0.10
 langchain-openai==1.1.10
 openai==2.26.0
+psycopg[binary]>=3.2,<3.3
+pymilvus>=2.5,<2.6
+pypdf>=5,<6
