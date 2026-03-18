@@ -111,6 +111,9 @@ class BrowserReactSkill(AgentSkill):
         """运行开放式浏览器 ReAct 流程，并返回统一 skill 输出。"""
         if create_agent is None:
             raise RuntimeError("当前环境缺少统一 agent 依赖；请先安装 langchain。")
+        memory_messages = []
+        if context.conversation_memory is not None:
+            memory_messages = list(context.conversation_memory.recent_messages or [])
         model = _build_agent_model(model_name=context.model_name, api_base_url=context.api_base_url)
         prompt = self.build_prompt(context=context, input_payload=input_payload)
         agent = create_agent(
@@ -124,7 +127,7 @@ class BrowserReactSkill(AgentSkill):
                 "messages": [
                     *[
                         HumanMessage(content=item.content) if item.role != "assistant" else AIMessage(content=item.content)
-                        for item in (context.conversation_memory.recent_messages or [])
+                        for item in memory_messages
                         if str(item.content or "").strip()
                     ],
                     HumanMessage(content=str(input_payload.get("message") or "").strip()),

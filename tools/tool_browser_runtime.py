@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import time
 from datetime import datetime
+from html import unescape
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,14 @@ def detect_chromium() -> str:
         path = shutil.which(name)
         if path:
             return path
+    playwright_cache_root = Path.home() / ".cache" / "ms-playwright"
+    if playwright_cache_root.exists():
+        for candidate in sorted(playwright_cache_root.glob("chromium-*/chrome-linux/chrome"), reverse=True):
+            if candidate.exists():
+                return str(candidate)
+        for candidate in sorted(playwright_cache_root.glob("chromium_headless_shell-*/chrome-linux/headless_shell"), reverse=True):
+            if candidate.exists():
+                return str(candidate)
     raise RuntimeError("没有找到 Chromium/Chrome 可执行文件。")
 
 
@@ -202,6 +211,37 @@ def _sanitize_text_payload(value: str) -> str:
     except json.JSONDecodeError:
         return _sanitize_sensitive_string(text)
     return json.dumps(_sanitize_debug_payload(payload), ensure_ascii=False, indent=2)
+
+
+def _looks_like_image_bytes(data: bytes) -> bool:
+    """按常见文件头快速判断一段字节是否像图片。"""
+    raw = bytes(data or b"")
+    if not raw:
+        return False
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if raw.startswith(b"\xff\xd8\xff"):
+        return True
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    if raw.startswith(b"BM"):
+        return True
+    return len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"
+
+
+def _decode_bytes_preview(data: bytes, max_chars: int = 240) -> str:
+    """把字节尽量转成可读预览，方便调试挑战页/非图片响应。"""
+    raw = bytes(data or b"")
+    if not raw:
+        return ""
+    for encoding in ("utf-8", "gb18030", "latin-1"):
+        try:
+            text = raw.decode(encoding, errors="ignore")
+        except Exception:
+            continue
+        if text.strip():
+            return _trim_text(re.sub(r"\s+", " ", text).strip(), max_chars)
+    return ""
 
 
 def _extract_cookie_names(raw_header: str) -> list[str]:
@@ -558,123 +598,9 @@ class AsyncBrowserSession:
         }
 
     def _browser_stealth_script(self) -> str:
-        """返回注入页面的拟真脚本，用来降低自动化痕迹。"""
+        """返回注入页面的最小脚本，只保留请求追踪，避免影响 creditchina 风控页。"""
         return """
 (() => {
-  const defineGetter = (object, property, getter) => {
-    try {
-      Object.defineProperty(object, property, { get: getter, configurable: true });
-    } catch (error) {
-    }
-  };
-  const defineValue = (object, property, value) => {
-    try {
-      Object.defineProperty(object, property, { value, configurable: true });
-    } catch (error) {
-    }
-  };
-  defineGetter(Navigator.prototype, "webdriver", () => undefined);
-  defineGetter(Navigator.prototype, "platform", () => "Win32");
-  defineGetter(Navigator.prototype, "vendor", () => "Google Inc.");
-  defineGetter(Navigator.prototype, "language", () => "zh-CN");
-  defineGetter(Navigator.prototype, "languages", () => ["zh-CN", "zh", "en-US", "en"]);
-  defineGetter(Navigator.prototype, "hardwareConcurrency", () => 8);
-  defineGetter(Navigator.prototype, "deviceMemory", () => 8);
-  defineGetter(Navigator.prototype, "maxTouchPoints", () => 0);
-  defineGetter(Navigator.prototype, "pdfViewerEnabled", () => true);
-
-  if (!window.chrome) {
-    defineValue(window, "chrome", {});
-  }
-  if (!window.chrome.runtime) {
-    defineValue(window.chrome, "runtime", {});
-  }
-  if (!window.chrome.app) {
-    defineValue(window.chrome, "app", { isInstalled: false });
-  }
-
-  const plugins = [
-    {
-      name: "Chrome PDF Viewer",
-      filename: "internal-pdf-viewer",
-      description: "Portable Document Format",
-    },
-    {
-      name: "Chromium PDF Viewer",
-      filename: "internal-pdf-viewer",
-      description: "Portable Document Format",
-    },
-    {
-      name: "Microsoft Edge PDF Viewer",
-      filename: "internal-pdf-viewer",
-      description: "Portable Document Format",
-    },
-    {
-      name: "PDF Viewer",
-      filename: "internal-pdf-viewer",
-      description: "Portable Document Format",
-    },
-  ];
-  plugins.item = (index) => plugins[index] || null;
-  plugins.namedItem = (name) => plugins.find((plugin) => plugin.name === name) || null;
-  defineGetter(Navigator.prototype, "plugins", () => plugins);
-
-  const mimeTypes = [
-    {
-      type: "application/pdf",
-      suffixes: "pdf",
-      description: "Portable Document Format",
-      enabledPlugin: plugins[0],
-    },
-  ];
-  mimeTypes.item = (index) => mimeTypes[index] || null;
-  mimeTypes.namedItem = (name) => mimeTypes.find((item) => item.type === name) || null;
-  defineGetter(Navigator.prototype, "mimeTypes", () => mimeTypes);
-
-  const uaData = {
-    brands: [
-      { brand: "Chromium", version: "145" },
-      { brand: "Google Chrome", version: "145" },
-      { brand: "Not=A?Brand", version: "24" },
-    ],
-    mobile: false,
-    platform: "Windows",
-    getHighEntropyValues: async (hints) => {
-      const values = {
-        architecture: "x86",
-        bitness: "64",
-        brands: [
-          { brand: "Chromium", version: "145" },
-          { brand: "Google Chrome", version: "145" },
-          { brand: "Not=A?Brand", version: "24" },
-        ],
-        fullVersionList: [
-          { brand: "Chromium", version: "145.0.0.0" },
-          { brand: "Google Chrome", version: "145.0.0.0" },
-          { brand: "Not=A?Brand", version: "24.0.0.0" },
-        ],
-        mobile: false,
-        model: "",
-        platform: "Windows",
-        platformVersion: "10.0.0",
-        uaFullVersion: "145.0.0.0",
-        wow64: false,
-      };
-      if (!Array.isArray(hints)) {
-        return values;
-      }
-      return Object.fromEntries(hints.filter((hint) => hint in values).map((hint) => [hint, values[hint]]));
-    },
-    toJSON() {
-      return {
-        brands: this.brands,
-        mobile: this.mobile,
-        platform: this.platform,
-      };
-    },
-  };
-  defineGetter(Navigator.prototype, "userAgentData", () => uaData);
-
   const trackedRequests = [];
   const pushTrackedRequest = (rawUrl, method = "GET") => {
     try {
@@ -690,7 +616,14 @@ class AsyncBrowserSession:
       if (trackedRequests.length > 200) {
         trackedRequests.splice(0, trackedRequests.length - 200);
       }
-      defineValue(window, "__creditchinaTrackedRequests", trackedRequests);
+      try {
+        Object.defineProperty(window, "__creditchinaTrackedRequests", {
+          value: trackedRequests,
+          configurable: true,
+        });
+      } catch (error) {
+        window.__creditchinaTrackedRequests = trackedRequests;
+      }
     } catch (error) {
     }
   };
@@ -710,16 +643,6 @@ class AsyncBrowserSession:
     pushTrackedRequest(url, method);
     return originalOpen.call(this, method, url, ...rest);
   };
-
-  if (navigator.permissions && navigator.permissions.query) {
-    const originalQuery = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = (parameters) => {
-      if (parameters && parameters.name === "notifications") {
-        return Promise.resolve({ state: Notification.permission });
-      }
-      return originalQuery(parameters);
-    };
-  }
 })();
 """
 
@@ -1816,6 +1739,21 @@ class PlaywrightToolRuntime:
             if not rcw_token:
                 rcw_token = self._extract_rcw_from_url(url)
 
+        storage_values: dict[str, Any] = {}
+        try:
+            storage_values = await page.evaluate(
+                """
+                () => ({
+                  rcw_token: localStorage.getItem("_$rc") || "",
+                  ywtu: localStorage.getItem("$_YWTU") || "",
+                })
+                """
+            )
+        except Exception:
+            storage_values = {}
+        if not rcw_token:
+            rcw_token = str(storage_values.get("rcw_token") or "").strip()
+
         current_url = str(page.url or "")
         parsed_page = urlparse(current_url)
         page_query = parse_qs(parsed_page.query)
@@ -1838,6 +1776,7 @@ class PlaywrightToolRuntime:
             "scenes": scenes,
             "page_index": page_index,
             "rcw_token": rcw_token,
+            "storage_ywtu": str(storage_values.get("ywtu") or "").strip(),
             "private_api_urls": private_api_urls[:20],
         }
 
@@ -1901,52 +1840,89 @@ class PlaywrightToolRuntime:
         response_kind: str = "text",
     ) -> dict[str, Any]:
         """在页面上下文里发起 fetch，请求时天然复用浏览器会话。"""
-        payload = await page.evaluate(
-            """
-            async ({ url, method, headers, body, responseKind }) => {
-              const response = await fetch(url, {
-                method,
-                headers,
-                body: body || undefined,
-                credentials: "include",
-                mode: "cors",
-              });
-              const responseHeaders = {};
-              for (const [name, value] of response.headers.entries()) {
-                responseHeaders[name] = value;
-              }
-              if (responseKind === "base64") {
-                const buffer = await response.arrayBuffer();
-                let binary = "";
-                const bytes = new Uint8Array(buffer);
-                const chunkSize = 0x8000;
-                for (let index = 0; index < bytes.length; index += chunkSize) {
-                  binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+        request_method = str(method or "GET").upper()
+        request_headers = {str(key): str(value) for key, value in (headers or {}).items()}
+        request_body = str(body or "")
+        request_kind = str(response_kind or "text")
+        try:
+            payload = await page.evaluate(
+                """
+                async ({ url, method, headers, body, responseKind }) => {
+                  const response = await fetch(url, {
+                    method,
+                    headers,
+                    body: body || undefined,
+                    credentials: "include",
+                    mode: "cors",
+                  });
+                  const responseHeaders = {};
+                  for (const [name, value] of response.headers.entries()) {
+                    responseHeaders[name] = value;
+                  }
+                  if (responseKind === "base64") {
+                    const buffer = await response.arrayBuffer();
+                    let binary = "";
+                    const bytes = new Uint8Array(buffer);
+                    const chunkSize = 0x8000;
+                    for (let index = 0; index < bytes.length; index += chunkSize) {
+                      binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+                    }
+                    return {
+                      ok: response.ok,
+                      status: response.status,
+                      headers: responseHeaders,
+                      base64: btoa(binary),
+                    };
+                  }
+                  return {
+                    ok: response.ok,
+                    status: response.status,
+                    headers: responseHeaders,
+                    text: await response.text(),
+                  };
                 }
+                """,
+                {
+                    "url": str(url),
+                    "method": request_method,
+                    "headers": request_headers,
+                    "body": request_body,
+                    "responseKind": request_kind,
+                },
+            )
+            return dict(payload or {})
+        except Exception as exc:
+            self._push_debug_event(
+                "creditchina_fetch_fallback",
+                {
+                    "url": url,
+                    "method": request_method,
+                    "response_kind": request_kind,
+                    "error": _trim_text(str(exc), 280),
+                },
+            )
+            api_response = await page.context.request.fetch(
+                str(url),
+                method=request_method,
+                headers=request_headers or None,
+                data=request_body or None,
+                fail_on_status_code=False,
+            )
+            response_headers = {str(key): str(value) for key, value in dict(api_response.headers).items()}
+            if request_kind == "base64":
+                raw_bytes = await api_response.body()
                 return {
-                  ok: response.ok,
-                  status: response.status,
-                  headers: responseHeaders,
-                  base64: btoa(binary),
-                };
-              }
-              return {
-                ok: response.ok,
-                status: response.status,
-                headers: responseHeaders,
-                text: await response.text(),
-              };
+                    "ok": api_response.ok,
+                    "status": api_response.status,
+                    "headers": response_headers,
+                    "base64": base64.b64encode(raw_bytes).decode("ascii"),
+                }
+            return {
+                "ok": api_response.ok,
+                "status": api_response.status,
+                "headers": response_headers,
+                "text": await api_response.text(),
             }
-            """,
-            {
-                "url": str(url),
-                "method": str(method or "GET").upper(),
-                "headers": {str(key): str(value) for key, value in (headers or {}).items()},
-                "body": str(body or ""),
-                "responseKind": str(response_kind or "text"),
-            },
-        )
-        return dict(payload or {})
 
     async def _creditchina_api_json_request_async(
         self,
@@ -2004,6 +1980,10 @@ class PlaywrightToolRuntime:
         )
         base64_payload = str(response_payload.get("base64") or "").strip()
         image_bytes = base64.b64decode(base64_payload) if base64_payload else b""
+        response_headers = dict(response_payload.get("headers") or {})
+        content_type = str(response_headers.get("content-type") or "").strip().lower()
+        is_image = content_type.startswith("image/") if content_type else _looks_like_image_bytes(image_bytes)
+        response_preview = _decode_bytes_preview(image_bytes) if image_bytes and not is_image else ""
         self._push_debug_event(
             "creditchina_api_request",
             {
@@ -2016,9 +1996,12 @@ class PlaywrightToolRuntime:
         return {
             "status": int(response_payload.get("status") or 0),
             "ok": bool(response_payload.get("ok")),
-            "headers": dict(response_payload.get("headers") or {}),
+            "headers": response_headers,
             "image_bytes": image_bytes,
             "base64_size": len(base64_payload),
+            "content_type": content_type,
+            "is_image": is_image,
+            "response_preview": response_preview,
         }
 
     async def _creditchina_api_check_verify_async(
@@ -2061,13 +2044,37 @@ class PlaywrightToolRuntime:
         for attempt in range(1, captcha_limit + 1):
             verify_image = await self._creditchina_api_get_verify_async(page, rcw_token=rcw_token)
             image_bytes = bytes(verify_image.get("image_bytes") or b"")
+            content_type = str(verify_image.get("content_type") or "").strip().lower()
+            if image_bytes and not bool(verify_image.get("is_image")):
+                suffix = ".html" if "html" in content_type else ".bin"
+                invalid_payload_path = artifact_dir / f"{file_prefix}-{attempt}{suffix}"
+                invalid_payload_path.write_bytes(image_bytes)
+                verify_attempts.append(
+                    {
+                        "attempt": attempt,
+                        "captcha_image_path": str(invalid_payload_path),
+                        "captcha_image_kind": "non_image",
+                        "captcha_guess": "",
+                        "status": verify_image.get("status"),
+                        "content_type": content_type,
+                        "verify_code": None,
+                        "verify_msg": (
+                            f"验证码接口未返回有效图片，content-type={content_type or 'unknown'}；"
+                            f"预览：{verify_image.get('response_preview') or '空内容'}"
+                        ),
+                        "verify_ok": False,
+                    }
+                )
+                break
             if not image_bytes:
                 verify_attempts.append(
                     {
                         "attempt": attempt,
                         "captcha_image_path": "",
+                        "captcha_image_kind": "missing",
                         "captcha_guess": "",
                         "status": verify_image.get("status"),
+                        "content_type": content_type,
                         "verify_code": None,
                         "verify_msg": "验证码图片为空",
                         "verify_ok": False,
@@ -2076,7 +2083,23 @@ class PlaywrightToolRuntime:
                 break
             image_path = artifact_dir / f"{file_prefix}-{attempt}.png"
             image_path.write_bytes(image_bytes)
-            captcha_guess = solve_captcha_bytes(image_bytes)
+            try:
+                captcha_guess = solve_captcha_bytes(image_bytes)
+            except Exception as exc:
+                verify_attempts.append(
+                    {
+                        "attempt": attempt,
+                        "captcha_image_path": str(image_path),
+                        "captcha_image_kind": "image_parse_failed",
+                        "captcha_guess": "",
+                        "status": verify_image.get("status"),
+                        "content_type": content_type or "image/unknown",
+                        "verify_code": None,
+                        "verify_msg": f"验证码图片解析失败：{_trim_text(str(exc), 200)}",
+                        "verify_ok": False,
+                    }
+                )
+                break
             verify_payload = await self._creditchina_api_check_verify_async(
                 page,
                 rcw_token=rcw_token,
@@ -2086,8 +2109,10 @@ class PlaywrightToolRuntime:
             attempt_payload = {
                 "attempt": attempt,
                 "captcha_image_path": str(image_path),
+                "captcha_image_kind": "image",
                 "captcha_guess": captcha_guess,
                 "status": verify_payload.get("status"),
+                "content_type": content_type or "image/unknown",
                 "verify_code": verify_json.get("code"),
                 "verify_msg": verify_json.get("msg"),
                 "verify_ok": bool(verify_payload.get("verify_ok")),
@@ -2108,10 +2133,7 @@ class PlaywrightToolRuntime:
 
     def _creditchina_detail_requires_reverify(self, detail_json: dict[str, Any] | None) -> bool:
         """判断详情接口是否提示验证码失效，需要重新校验。"""
-        payload = dict(detail_json or {})
-        status = int(payload.get("status") or 0)
-        message = str(payload.get("message") or "")
-        return status == 10001 and "验证码已失效" in message
+        return self._creditchina_api_requires_reverify(detail_json)
 
     def _creditchina_pick_candidate(
         self,
@@ -2175,6 +2197,648 @@ class PlaywrightToolRuntime:
                 extra_query[key] = value
         return extra_query
 
+    def _build_creditchina_detail_api_query_from_candidate(
+        self,
+        selected_candidate: dict[str, Any] | None,
+        *,
+        credit_code: str,
+    ) -> dict[str, Any]:
+        """在不打开详情 HTML 的情况下，根据搜索命中主体直接组装详情接口参数。"""
+        candidate = dict(selected_candidate or {})
+        return {
+            "searchState": "1",
+            "entityType": str(candidate.get("entityType") or "1").strip() or "1",
+            "keyword": str(
+                candidate.get("accurate_entity_name_query")
+                or candidate.get("accurate_entity_name")
+                or credit_code
+            ).strip(),
+            "uuid": str(candidate.get("uuid") or "").strip(),
+            "tyshxydm": str(candidate.get("accurate_entity_code") or credit_code or "").strip().upper(),
+        }
+
+    def _creditchina_api_requires_reverify(self, payload: dict[str, Any] | None) -> bool:
+        """判断 creditchina private-api 是否提示验证码失效，需要重新校验。"""
+        response = dict(payload or {})
+        status = int(response.get("status") or 0)
+        message = str(response.get("message") or response.get("msg") or "")
+        return status != 1 and "验证码" in message
+
+    def _clean_creditchina_value(self, value: Any) -> str:
+        """清洗 creditchina 接口字段值，统一去掉 HTML 实体和空白噪音。"""
+        text = unescape(str(value or "")).replace("&nbsp;", " ").replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text).strip()
+        if text in {"— —", "--", "-", "None", "null"}:
+            return ""
+        return text
+
+    def _creditchina_int(self, value: Any, default: int | None = 0) -> int | None:
+        """把 creditchina 接口里的计数字段安全转成整数。"""
+        text = self._clean_creditchina_value(value)
+        if not text:
+            return default
+        try:
+            return int(float(text))
+        except (TypeError, ValueError):
+            return default
+
+    def _creditchina_is_penalty_table(self, table_name: str, category_name: str = "") -> bool:
+        """判断一个行政管理子表是否属于行政处罚通告。"""
+        normalized_table = str(table_name or "").strip().lower()
+        normalized_category = str(category_name or "").strip()
+        return "_xzcf_" in normalized_table or "处罚" in normalized_category
+
+    def _creditchina_parse_label_count_text(self, raw_value: Any) -> tuple[str, int | None]:
+        """把“行政管理 0 / 行政处罚(3)”这类文案拆成标签和数量。"""
+        text = self._clean_creditchina_value(raw_value)
+        if not text:
+            return "", None
+        match = re.match(r"^(.*?)(?:[\(\[（]?\s*)(\d+)(?:\s*[\)\]）])?$", text)
+        if not match:
+            return text, None
+        label = self._clean_creditchina_value(match.group(1))
+        count = self._creditchina_int(match.group(2), default=None)
+        return label or text, count
+
+    def _build_creditchina_type_count_summary(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        """整理 searchDateTypeCount 返回的栏目计数。"""
+        data = dict((payload or {}).get("data") or {})
+        counts: dict[str, int] = {}
+        for key, raw_value in data.items():
+            count = self._creditchina_int(raw_value, default=None)
+            if count is None:
+                continue
+            counts[str(key)] = count
+        return {"counts": counts}
+
+    def _build_creditchina_category_summary(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        """整理 searchDateCategoryCount 返回的行政管理分类与数量。"""
+        data = dict((payload or {}).get("data") or {})
+        entity = dict(data.get("entity") or {})
+        table_map = {
+            str(key): self._clean_creditchina_value(value) or str(key)
+            for key, value in dict(data.get("tableMap") or {}).items()
+        }
+        categories: list[dict[str, Any]] = []
+        for table_name, raw_count in entity.items():
+            normalized_table_name = str(table_name or "").strip()
+            if not normalized_table_name:
+                continue
+            count = self._creditchina_int(raw_count, default=0) or 0
+            category_name = table_map.get(normalized_table_name) or normalized_table_name
+            categories.append(
+                {
+                    "table_name": normalized_table_name,
+                    "category_name": category_name,
+                    "count": count,
+                    "is_penalty_notice": self._creditchina_is_penalty_table(normalized_table_name, category_name),
+                }
+            )
+        categories.sort(key=lambda item: (-int(item.get("count") or 0), str(item.get("category_name") or "")))
+        total = self._creditchina_int(data.get("全部"), default=sum(int(item.get("count") or 0) for item in categories)) or 0
+        penalty_categories = [dict(item) for item in categories if bool(item.get("is_penalty_notice"))]
+        penalty_total = sum(int(item.get("count") or 0) for item in penalty_categories)
+        return {
+            "total": total,
+            "categories": categories,
+            "penalty_categories": penalty_categories,
+            "penalty_total": penalty_total,
+            "table_labels": table_map,
+        }
+
+    def _build_creditchina_field_items(
+        self,
+        *,
+        row_data: dict[str, Any],
+        column_list: list[str],
+        sences_map: dict[str, Any],
+        skip_keys: set[str] | None = None,
+    ) -> tuple[list[dict[str, str]], dict[str, str]]:
+        """把字段列表整理成统一的 key/label/value 结构。"""
+        skipped = set(skip_keys or set())
+        ordered_keys: list[str] = []
+        seen: set[str] = set()
+        for raw_key in list(column_list or []):
+            key = str(raw_key or "").strip()
+            if not key or key in seen:
+                continue
+            ordered_keys.append(key)
+            seen.add(key)
+        for raw_key in ("recid", "id", "uuid", "flowno"):
+            key = str(raw_key).strip()
+            if key in seen:
+                continue
+            ordered_keys.append(key)
+            seen.add(key)
+
+        items: list[dict[str, str]] = []
+        field_map: dict[str, str] = {}
+        for key in ordered_keys:
+            if key in skipped:
+                continue
+            value = self._clean_creditchina_value(row_data.get(key))
+            if not value and key not in {"recid", "id", "uuid", "flowno"}:
+                continue
+            label = self._clean_creditchina_value(sences_map.get(key)) or key
+            items.append({"key": key, "label": label, "value": value})
+            field_map[key] = value
+        return items, field_map
+
+    def _pick_creditchina_field_value(
+        self,
+        field_items: list[dict[str, str]],
+        *,
+        label_keywords: tuple[str, ...] = (),
+        key_keywords: tuple[str, ...] = (),
+    ) -> str:
+        """按标签或字段名关键词，从字段列表中取最匹配的值。"""
+        normalized_labels = tuple(str(keyword or "").strip().lower() for keyword in label_keywords if str(keyword or "").strip())
+        normalized_keys = tuple(str(keyword or "").strip().lower() for keyword in key_keywords if str(keyword or "").strip())
+
+        if normalized_labels:
+            for item in field_items:
+                label = str(item.get("label") or "").strip().lower()
+                value = self._clean_creditchina_value(item.get("value"))
+                if value and any(keyword in label for keyword in normalized_labels):
+                    return value
+
+        if normalized_keys:
+            for item in field_items:
+                key = str(item.get("key") or "").strip().lower()
+                value = self._clean_creditchina_value(item.get("value"))
+                if value and any(keyword in key for keyword in normalized_keys):
+                    return value
+        return ""
+
+    def _normalize_creditchina_record(
+        self,
+        *,
+        table_name: str,
+        category_name: str,
+        row_data: dict[str, Any],
+        column_list: list[str],
+        sences_map: dict[str, Any],
+        data_source: str,
+        source_endpoint: str,
+    ) -> dict[str, Any]:
+        """把一条行政管理/处罚记录规整成统一结构。"""
+        field_items, field_map = self._build_creditchina_field_items(
+            row_data=dict(row_data or {}),
+            column_list=[str(item or "").strip() for item in list(column_list or [])],
+            sences_map={str(key): value for key, value in dict(sences_map or {}).items()},
+            skip_keys={"bz", "cf_ly", "yjjid"},
+        )
+        identifiers = {
+            key: self._clean_creditchina_value((row_data or {}).get(key))
+            for key in ("recid", "id", "uuid", "flowno")
+            if self._clean_creditchina_value((row_data or {}).get(key))
+        }
+        decision_date = self._pick_creditchina_field_value(
+            field_items,
+            label_keywords=("处罚决定日期", "决定日期", "作出日期", "发布日期", "公示日期"),
+            key_keywords=("cf_jdrq", "jdrq", "decision", "pubdate"),
+        )
+        document_number = self._pick_creditchina_field_value(
+            field_items,
+            label_keywords=("行政处罚决定书文号", "处罚决定书文号", "决定书文号", "文书号"),
+            key_keywords=("cf_wsh", "wsh", "flowno"),
+        )
+        authority = self._pick_creditchina_field_value(
+            field_items,
+            label_keywords=("处罚机关", "决定机关", "作出机关", "行政处罚决定机关"),
+            key_keywords=("cf_cfjg", "punishdep", "organ"),
+        )
+        content = self._pick_creditchina_field_value(
+            field_items,
+            label_keywords=("行政处罚内容", "处罚内容", "违法事实", "违法行为类型", "处罚事由", "处罚结果"),
+            key_keywords=("cf_cfmc", "wfxw", "cfsy", "jg"),
+        )
+        amount = self._pick_creditchina_field_value(
+            field_items,
+            label_keywords=("罚款金额", "没收金额", "处罚金额", "罚款"),
+            key_keywords=("fkje", "cfje", "money", "amount"),
+        )
+        publication_date = self._pick_creditchina_field_value(
+            field_items,
+            label_keywords=("公示日期", "发布时间"),
+            key_keywords=("pubdate", "fbrq"),
+        )
+        return {
+            "source": "信用中国",
+            "source_endpoint": source_endpoint,
+            "table_name": str(table_name or "").strip(),
+            "category_name": self._clean_creditchina_value(category_name) or str(table_name or "").strip(),
+            "data_source": self._clean_creditchina_value(data_source),
+            "is_penalty_notice": self._creditchina_is_penalty_table(table_name, category_name),
+            "decision_date": decision_date,
+            "publication_date": publication_date,
+            "document_number": document_number,
+            "authority": authority,
+            "content": content,
+            "amount": amount,
+            "identifiers": identifiers,
+            "fields": field_items,
+            "field_map": field_map,
+        }
+
+    def _normalize_creditchina_record_page(
+        self,
+        *,
+        endpoint: str,
+        response_json: dict[str, Any],
+        table_labels: dict[str, str] | None = None,
+        table_name: str = "",
+        category_name: str = "",
+    ) -> list[dict[str, Any]]:
+        """按接口类型，把一页行政管理记录转成统一列表。"""
+        data = dict(response_json.get("data") or {})
+        records: list[dict[str, Any]] = []
+        if endpoint == "typeSourceSearch":
+            for raw_item in list(data.get("list") or []):
+                item = dict(raw_item or {})
+                row_table_name = str(item.get("table_name") or "").strip()
+                row_category_name = (
+                    str((table_labels or {}).get(row_table_name) or "")
+                    or self._clean_creditchina_value(item.get("tableName"))
+                    or row_table_name
+                )
+                records.append(
+                    self._normalize_creditchina_record(
+                        table_name=row_table_name,
+                        category_name=row_category_name,
+                        row_data=dict(item.get("entity") or {}),
+                        column_list=[str(value or "").strip() for value in list(item.get("columnList") or [])],
+                        sences_map=dict(item.get("sencesMap") or {}),
+                        data_source=str(item.get("dataSource") or ""),
+                        source_endpoint=endpoint,
+                    )
+                )
+            return records
+
+        page_column_list = [str(value or "").strip() for value in list(data.get("columnList") or [])]
+        page_sences_map = dict(data.get("sencesMap") or {})
+        for raw_item in list(data.get("list") or []):
+            item = dict(raw_item or {})
+            records.append(
+                self._normalize_creditchina_record(
+                    table_name=table_name,
+                    category_name=category_name,
+                    row_data=item,
+                    column_list=page_column_list,
+                    sences_map=page_sences_map,
+                    data_source=str(item.get("dataSource") or data.get("dataSource") or ""),
+                    source_endpoint=endpoint,
+                )
+            )
+        return records
+
+    def _creditchina_record_identity(self, record: dict[str, Any]) -> str:
+        """为行政管理/处罚记录生成稳定去重键。"""
+        item = dict(record or {})
+        table_name = str(item.get("table_name") or "").strip()
+        identifiers = dict(item.get("identifiers") or {})
+        for key in ("recid", "id", "flowno", "uuid"):
+            value = self._clean_creditchina_value(identifiers.get(key))
+            if value:
+                return f"{table_name}:{key}:{value}"
+        fallback_parts = [
+            self._clean_creditchina_value(item.get("document_number")),
+            self._clean_creditchina_value(item.get("decision_date")),
+            self._clean_creditchina_value(item.get("content")),
+        ]
+        fallback = "|".join(part for part in fallback_parts if part)
+        return f"{table_name}:{fallback}" if fallback else table_name
+
+    def _deduplicate_creditchina_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """对行政管理/处罚记录去重。"""
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for record in list(records or []):
+            item = dict(record or {})
+            identity = self._creditchina_record_identity(item)
+            if identity and identity in seen:
+                continue
+            if identity:
+                seen.add(identity)
+            deduped.append(item)
+        return deduped
+
+    async def _creditchina_api_request_with_verify_async(
+        self,
+        page: AsyncPage,
+        artifact_dir: Path,
+        *,
+        endpoint: str,
+        rcw_token: str,
+        extra_query: dict[str, Any],
+        max_captcha_attempts: int,
+        file_prefix: str,
+    ) -> dict[str, Any]:
+        """请求一个 creditchina private-api，并在需要时自动补验证码校验。"""
+        payload = await self._creditchina_api_json_request_async(
+            page,
+            endpoint=endpoint,
+            rcw_token=rcw_token,
+            extra_query=extra_query,
+        )
+        response_json = dict(payload.get("json") or {})
+        verify_payload: dict[str, Any] | None = None
+        verify_attempts: list[dict[str, Any]] = []
+        if self._creditchina_api_requires_reverify(response_json):
+            verify_payload, verify_attempts = await self._run_creditchina_private_api_verify_async(
+                page,
+                artifact_dir,
+                rcw_token=rcw_token,
+                max_attempts=max_captcha_attempts,
+                file_prefix=file_prefix,
+            )
+            if verify_payload is not None:
+                payload = await self._creditchina_api_json_request_async(
+                    page,
+                    endpoint=endpoint,
+                    rcw_token=rcw_token,
+                    extra_query=extra_query,
+                )
+                response_json = dict(payload.get("json") or {})
+        return {
+            **payload,
+            "json": response_json,
+            "verify": verify_payload,
+            "verify_attempts": verify_attempts,
+        }
+
+    async def _fetch_creditchina_record_pages_async(
+        self,
+        page: AsyncPage,
+        artifact_dir: Path,
+        *,
+        endpoint: str,
+        rcw_token: str,
+        extra_query_base: dict[str, Any],
+        max_captcha_attempts: int,
+        file_prefix: str,
+        table_labels: dict[str, str] | None = None,
+        table_name: str = "",
+        category_name: str = "",
+        page_size: int = 50,
+        pub_sort: str = "desc",
+        max_pages: int = 20,
+        max_records: int = 500,
+    ) -> dict[str, Any]:
+        """分页拉取 creditchina 行政管理/处罚记录。"""
+        records: list[dict[str, Any]] = []
+        verify_events: list[dict[str, Any]] = []
+        errors: list[str] = []
+        total_pages = 1
+        total_records = 0
+        requested_pages = 0
+        truncated = False
+        partial = False
+        page_limit = max(1, min(int(max_pages), 50))
+        record_limit = max(1, min(int(max_records), 2_000))
+
+        for page_number in range(1, page_limit + 1):
+            query = dict(extra_query_base or {})
+            query["page"] = str(page_number)
+            query["pageSize"] = str(page_size)
+            if str(pub_sort or "").strip():
+                query["pubSort"] = str(pub_sort).strip()
+            request_payload = await self._creditchina_api_request_with_verify_async(
+                page,
+                artifact_dir,
+                endpoint=endpoint,
+                rcw_token=rcw_token,
+                extra_query=query,
+                max_captcha_attempts=max_captcha_attempts,
+                file_prefix=f"{file_prefix}-page-{page_number}",
+            )
+            requested_pages += 1
+            if request_payload.get("verify") or list(request_payload.get("verify_attempts") or []):
+                verify_events.append(
+                    {
+                        "page": page_number,
+                        "verify": request_payload.get("verify"),
+                        "verify_attempts": list(request_payload.get("verify_attempts") or []),
+                    }
+                )
+
+            response_json = dict(request_payload.get("json") or {})
+            if int(response_json.get("status") or 0) != 1:
+                errors.append(f"{endpoint} 第 {page_number} 页未返回成功状态。")
+                partial = page_number > 1
+                break
+
+            data = dict(response_json.get("data") or {})
+            if page_number == 1:
+                total_pages = max(1, self._creditchina_int(data.get("totalSize"), default=1) or 1)
+                total_records = self._creditchina_int(data.get("total"), default=0) or 0
+
+            page_records = self._normalize_creditchina_record_page(
+                endpoint=endpoint,
+                response_json=response_json,
+                table_labels=table_labels,
+                table_name=table_name,
+                category_name=category_name,
+            )
+            records.extend(page_records)
+            if len(records) >= record_limit:
+                records = records[:record_limit]
+                truncated = True
+                break
+            if page_number >= total_pages:
+                break
+
+        if requested_pages < total_pages:
+            truncated = True
+
+        return {
+            "ok": not errors,
+            "endpoint": endpoint,
+            "requested_pages": requested_pages,
+            "total_pages": total_pages,
+            "total_records": total_records,
+            "truncated": truncated,
+            "partial": partial,
+            "errors": errors,
+            "verify_events": verify_events,
+            "records": self._deduplicate_creditchina_records(records),
+        }
+
+    async def _fetch_creditchina_administrative_penalty_async(
+        self,
+        page: AsyncPage,
+        artifact_dir: Path,
+        *,
+        rcw_token: str,
+        detail_runtime_state: dict[str, Any] | None,
+        max_captcha_attempts: int,
+    ) -> dict[str, Any]:
+        """抓取信用中国详情页“行政管理/处罚通告”相关数据。"""
+        state = dict(detail_runtime_state or {})
+        query = self._build_creditchina_detail_api_query(state)
+        search_keyword = str(query.get("keyword") or state.get("keyword") or "").strip()
+        entity_type = str(query.get("entityType") or state.get("entity_type") or "1").strip() or "1"
+        search_state = str(query.get("searchState") or state.get("search_state") or "1").strip() or "1"
+        tyshxydm = str(query.get("tyshxydm") or state.get("tyshxydm") or search_keyword).strip().upper()
+        scenes = str(state.get("scenes") or "defaultscenario").strip() or "defaultscenario"
+
+        type_count_payload = await self._creditchina_api_request_with_verify_async(
+            page,
+            artifact_dir,
+            endpoint="searchDateTypeCount",
+            rcw_token=rcw_token,
+            extra_query={
+                "entityType": entity_type,
+                "searchState": search_state,
+                "keyword": search_keyword,
+                "tyshxydm": tyshxydm,
+            },
+            max_captcha_attempts=max_captcha_attempts,
+            file_prefix="creditchina-search-type-count-verify",
+        )
+        type_count_json = dict(type_count_payload.get("json") or {})
+        type_count_summary = self._build_creditchina_type_count_summary(type_count_json)
+
+        category_payload = await self._creditchina_api_request_with_verify_async(
+            page,
+            artifact_dir,
+            endpoint="searchDateCategoryCount",
+            rcw_token=rcw_token,
+            extra_query={
+                "type": "行政管理",
+                "searchState": search_state,
+                "keyword": search_keyword,
+                "entityType": entity_type,
+                "tyshxydm": tyshxydm,
+            },
+            max_captcha_attempts=max_captcha_attempts,
+            file_prefix="creditchina-search-category-count-verify",
+        )
+        category_json = dict(category_payload.get("json") or {})
+        category_summary = self._build_creditchina_category_summary(category_json)
+        table_labels = dict(category_summary.get("table_labels") or {})
+
+        all_records_payload = await self._fetch_creditchina_record_pages_async(
+            page,
+            artifact_dir,
+            endpoint="typeSourceSearch",
+            rcw_token=rcw_token,
+            extra_query_base={
+                "source": "",
+                "type": "行政管理",
+                "searchState": search_state,
+                "entityType": entity_type,
+                "scenes": scenes,
+                "keyword": search_keyword,
+                "tyshxydm": tyshxydm,
+            },
+            max_captcha_attempts=max_captcha_attempts,
+            file_prefix="creditchina-type-source-search-verify",
+            table_labels=table_labels,
+            page_size=50,
+        )
+
+        penalty_records: list[dict[str, Any]] = []
+        penalty_fetches: list[dict[str, Any]] = []
+        for category in list(category_summary.get("penalty_categories") or []):
+            table_name = str(category.get("table_name") or "").strip()
+            category_name = str(category.get("category_name") or "").strip()
+            if not table_name or int(category.get("count") or 0) <= 0:
+                continue
+            category_records = await self._fetch_creditchina_record_pages_async(
+                page,
+                artifact_dir,
+                endpoint="catalogSearch",
+                rcw_token=rcw_token,
+                extra_query_base={
+                    "tableName": table_name,
+                    "searchState": search_state,
+                    "scenes": scenes,
+                    "keyword": search_keyword,
+                    "tyshxydm": tyshxydm,
+                },
+                max_captcha_attempts=max_captcha_attempts,
+                file_prefix=f"creditchina-catalog-search-{table_name}-verify",
+                table_name=table_name,
+                category_name=category_name,
+                page_size=50,
+            )
+            penalty_fetches.append(
+                {
+                    "table_name": table_name,
+                    "category_name": category_name,
+                    "count": int(category.get("count") or 0),
+                    "ok": category_records.get("ok"),
+                    "requested_pages": category_records.get("requested_pages"),
+                    "total_pages": category_records.get("total_pages"),
+                    "truncated": category_records.get("truncated"),
+                    "partial": category_records.get("partial"),
+                    "errors": list(category_records.get("errors") or []),
+                }
+            )
+            penalty_records.extend(list(category_records.get("records") or []))
+
+        deduped_all_records = self._deduplicate_creditchina_records(list(all_records_payload.get("records") or []))
+        deduped_penalty_records = self._deduplicate_creditchina_records(penalty_records)
+        if not deduped_penalty_records:
+            deduped_penalty_records = [
+                dict(record)
+                for record in deduped_all_records
+                if bool(record.get("is_penalty_notice"))
+            ]
+
+        summary = {
+            "source": "信用中国",
+            "category_counts": dict(type_count_summary.get("counts") or {}),
+            "administrative_management": {
+                "total": int(category_summary.get("total") or 0),
+                "categories": list(category_summary.get("categories") or []),
+                "records": deduped_all_records,
+                "record_count": len(deduped_all_records),
+                "records_truncated": bool(all_records_payload.get("truncated")),
+                "records_partial": bool(all_records_payload.get("partial")),
+            },
+            "penalty_notices": {
+                "total": int(category_summary.get("penalty_total") or len(deduped_penalty_records)),
+                "categories": list(category_summary.get("penalty_categories") or []),
+                "records": deduped_penalty_records,
+                "record_count": len(deduped_penalty_records),
+                "records_truncated": any(bool(item.get("truncated")) for item in penalty_fetches),
+            },
+        }
+
+        return {
+            "query_context": {
+                "keyword": search_keyword,
+                "entityType": entity_type,
+                "searchState": search_state,
+                "tyshxydm": tyshxydm,
+                "scenes": scenes,
+            },
+            "type_counts": {
+                "ok": int(type_count_json.get("status") or 0) == 1,
+                "verify": type_count_payload.get("verify"),
+                "verify_attempts": list(type_count_payload.get("verify_attempts") or []),
+                "summary": type_count_summary,
+            },
+            "administrative_management": {
+                "category_counts_ok": int(category_json.get("status") or 0) == 1,
+                "category_verify": category_payload.get("verify"),
+                "category_verify_attempts": list(category_payload.get("verify_attempts") or []),
+                "category_summary": category_summary,
+                "all_records": {
+                    "ok": all_records_payload.get("ok"),
+                    "requested_pages": all_records_payload.get("requested_pages"),
+                    "total_pages": all_records_payload.get("total_pages"),
+                    "truncated": all_records_payload.get("truncated"),
+                    "partial": all_records_payload.get("partial"),
+                    "errors": list(all_records_payload.get("errors") or []),
+                },
+                "penalty_fetches": penalty_fetches,
+            },
+            "summary": summary,
+        }
+
     def _normalize_creditchina_api_result(
         self,
         *,
@@ -2182,6 +2846,7 @@ class PlaywrightToolRuntime:
         credit_code: str,
         selected_candidate: dict[str, Any] | None,
         detail_payload: dict[str, Any],
+        administrative_penalty_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """把 API 返回整理成统一的业务字段结构。"""
         detail_data = dict(detail_payload.get("data") or {})
@@ -2190,6 +2855,7 @@ class PlaywrightToolRuntime:
         head_entity = dict(detail_data.get("headEntity") or {})
         customs_section = dict(detail_data.get("hgData") or {})
         customs_entity = dict(customs_section.get("entity") or {})
+        penalty_summary = dict((administrative_penalty_payload or {}).get("summary") or {})
         normalized = {
             "enterprise_name": str(head_entity.get("jgmc") or selected_candidate.get("accurate_entity_name") if selected_candidate else ""),
             "credit_code": str(head_entity.get("tyshxydm") or credit_code or "").strip().upper(),
@@ -2199,6 +2865,10 @@ class PlaywrightToolRuntime:
             "establish_date": str(basic_entity.get("esdate") or ""),
             "address": str(basic_entity.get("dom") or ""),
             "registration_authority": str(basic_entity.get("regorg") or ""),
+            "source": "信用中国",
+            "category_counts": dict(penalty_summary.get("category_counts") or {}),
+            "administrative_management": dict(penalty_summary.get("administrative_management") or {}),
+            "penalty_notices": dict(penalty_summary.get("penalty_notices") or {}),
         }
         return {
             "input": {
@@ -2209,6 +2879,7 @@ class PlaywrightToolRuntime:
                 "head_entity": head_entity,
                 "basic_entity": basic_entity,
                 "customs_entity": customs_entity,
+                "administrative_penalty": administrative_penalty_payload or {},
             },
             "normalized": normalized,
         }
@@ -2220,9 +2891,11 @@ class PlaywrightToolRuntime:
         credit_code: str,
         candidate: dict[str, Any] | None,
         body_text: str,
+        detail_dom_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """把 DOM 提取结果规整成与 API 结果同构的格式。"""
         selected_candidate = dict(candidate or {})
+        detail_payload = dict(detail_dom_payload or {})
         normalized_credit_code = (
             str(selected_candidate.get("accurate_entity_code") or credit_code or "").strip().upper()
         )
@@ -2230,6 +2903,7 @@ class PlaywrightToolRuntime:
             selected_candidate.get("accurate_entity_name")
             or selected_candidate.get("accurate_entity_name_query")
             or selected_candidate.get("company_name")
+            or (search_keyword if str(search_keyword or "").strip().upper() != normalized_credit_code else "")
             or ""
         ).strip()
         enterprise_type = str(
@@ -2238,6 +2912,23 @@ class PlaywrightToolRuntime:
             or selected_candidate.get("entityType")
             or ""
         ).strip()
+        if enterprise_type.isdigit():
+            enterprise_type = ""
+        top_level_counts = {
+            str(key): int(value)
+            for key, value in dict(detail_payload.get("top_level_counts") or {}).items()
+            if str(key or "").strip()
+        }
+        administrative_categories = [dict(item) for item in list(detail_payload.get("administrative_categories") or [])]
+        penalty_categories = [dict(item) for item in list(detail_payload.get("penalty_categories") or [])]
+        administrative_total = self._creditchina_int(
+            top_level_counts.get("行政管理"),
+            default=sum(int(item.get("count") or 0) for item in administrative_categories),
+        ) or 0
+        penalty_total = self._creditchina_int(
+            detail_payload.get("penalty_total"),
+            default=sum(int(item.get("count") or 0) for item in penalty_categories),
+        ) or 0
         return {
             "input": {
                 "keyword": str(search_keyword or normalized_credit_code or "").strip(),
@@ -2246,6 +2937,7 @@ class PlaywrightToolRuntime:
             "detail": {
                 "page_candidate": selected_candidate,
                 "body_excerpt": _trim_text(body_text, 600),
+                "detail_dom": detail_payload,
             },
             "normalized": {
                 "enterprise_name": enterprise_name,
@@ -2256,7 +2948,136 @@ class PlaywrightToolRuntime:
                 "establish_date": "",
                 "address": "",
                 "registration_authority": "",
+                "source": "信用中国",
+                "category_counts": top_level_counts,
+                "administrative_management": {
+                    "total": administrative_total,
+                    "categories": administrative_categories,
+                    "records": [],
+                    "record_count": 0,
+                    "records_truncated": False,
+                    "records_partial": False,
+                    "detail_dom_excerpt": str(detail_payload.get("result_tab2_text") or ""),
+                },
+                "penalty_notices": {
+                    "total": penalty_total,
+                    "categories": penalty_categories,
+                    "records": [],
+                    "record_count": 0,
+                    "records_truncated": False,
+                    "detail_dom_excerpt": str(detail_payload.get("result_tab2_text") or ""),
+                },
             },
+        }
+
+    async def _extract_creditchina_detail_dom_payload_async(self, page: AsyncPage) -> dict[str, Any]:
+        """从信用中国详情页 DOM 中提取栏目计数和行政管理区域内容。"""
+        try:
+            raw_payload = await page.evaluate(
+                """
+                () => {
+                  const normalize = (value, maxLen = 600) =>
+                    String(value || "").replace(/\\s+/g, " ").trim().slice(0, maxLen);
+                  const parseCount = (value) => {
+                    const match = normalize(value).match(/(\\d+)/);
+                    return match ? Number(match[1]) : null;
+                  };
+                  const uniq = (values, limit = 80) => Array.from(new Set(values.filter(Boolean))).slice(0, limit);
+                  const tabCounts = Array.from(document.querySelectorAll("ul.tab-title > li")).map((node) => {
+                    const emText = normalize(node.querySelector("em")?.textContent || "", 40);
+                    const rawText = normalize(node.innerText || node.textContent || "", 120);
+                    const label = normalize(rawText.replace(emText, ""), 80);
+                    return {
+                      id: node.id || "",
+                      label,
+                      raw_text: rawText,
+                      count: parseCount(emText || rawText),
+                      active: node.classList.contains("cur"),
+                    };
+                  });
+                  const catalogTexts = uniq(
+                    Array.from(
+                      document.querySelectorAll("#xzglCatalog a, #xzglCatalog li, #xzglCatalog span, #xzglCatalog dd, #xzglCatalog dt, #xzglCatalog p, #xzglCatalog div")
+                    ).map((node) => normalize(node.innerText || node.textContent || "", 160))
+                  );
+                  const resultTexts = uniq(
+                    Array.from(
+                      document.querySelectorAll("#resultTab2 tr, #resultTab2 li, #resultTab2 dd, #resultTab2 dl, #resultTab2 p, #resultTab2 div")
+                    ).map((node) => normalize(node.innerText || node.textContent || "", 240)),
+                    60
+                  );
+                  return {
+                    tab_counts: tabCounts,
+                    xzgl_text: normalize(document.querySelector("#xzglCatalog")?.innerText || "", 1200),
+                    result_tab2_text: normalize(document.querySelector("#resultTab2")?.innerText || "", 1200),
+                    catalog_texts: catalogTexts,
+                    result_texts: resultTexts,
+                  };
+                }
+                """
+            )
+        except Exception:
+            return {}
+
+        top_level_counts: dict[str, int] = {}
+        tab_counts: list[dict[str, Any]] = []
+        for raw_item in list((raw_payload or {}).get("tab_counts") or []):
+            item = dict(raw_item or {})
+            label = self._clean_creditchina_value(item.get("label") or "")
+            raw_text = self._clean_creditchina_value(item.get("raw_text") or item.get("text") or "")
+            if not label and raw_text:
+                label, _ = self._creditchina_parse_label_count_text(raw_text)
+            count = self._creditchina_int(item.get("count"), default=None)
+            if count is None and raw_text:
+                _, count = self._creditchina_parse_label_count_text(raw_text)
+            if not label:
+                continue
+            normalized_item = {
+                "id": str(item.get("id") or "").strip(),
+                "label": label,
+                "count": int(count or 0),
+                "active": bool(item.get("active")),
+            }
+            tab_counts.append(normalized_item)
+            top_level_counts[label] = int(count or 0)
+
+        administrative_categories: list[dict[str, Any]] = []
+        seen_category_keys: set[str] = set()
+        for raw_text in list((raw_payload or {}).get("catalog_texts") or []):
+            label, count = self._creditchina_parse_label_count_text(raw_text)
+            if not label:
+                continue
+            identity = f"{label}:{count if count is not None else ''}"
+            if identity in seen_category_keys:
+                continue
+            seen_category_keys.add(identity)
+            administrative_categories.append(
+                {
+                    "category_name": label,
+                    "count": int(count or 0),
+                    "is_penalty_notice": self._creditchina_is_penalty_table("", label),
+                }
+            )
+
+        penalty_categories = [
+            dict(item)
+            for item in administrative_categories
+            if bool(item.get("is_penalty_notice"))
+        ]
+        return {
+            "has_detail_tabs": bool(tab_counts),
+            "top_level_counts": top_level_counts,
+            "tab_counts": tab_counts,
+            "administrative_categories": administrative_categories,
+            "penalty_categories": penalty_categories,
+            "penalty_total": sum(int(item.get("count") or 0) for item in penalty_categories),
+            "xzgl_text": self._clean_creditchina_value((raw_payload or {}).get("xzgl_text")),
+            "result_tab2_text": self._clean_creditchina_value((raw_payload or {}).get("result_tab2_text")),
+            "result_texts": [
+                self._clean_creditchina_value(text)
+                for text in list((raw_payload or {}).get("result_texts") or [])
+                if self._clean_creditchina_value(text)
+            ][:40],
         }
 
     def _extract_creditchina_result_fields(self, result: dict[str, Any] | None) -> dict[str, Any]:
@@ -2298,7 +3119,10 @@ class PlaywrightToolRuntime:
     ) -> dict[str, Any]:
         """从 creditchina 页面 DOM 中抽取企业候选与结构化结果。"""
         expected_credit_code = str(credit_code or self._extract_creditchina_keyword(page.url)).strip().upper()
-        search_keyword = expected_credit_code or str(self._extract_creditchina_keyword(page.url)).strip()
+        page_query = parse_qs(urlparse(str(page.url or "")).query)
+        url_keyword = str((page_query.get("keyword") or [""])[0] or "").strip()
+        detail_query_code = str((page_query.get("tyshxydm") or [""])[0] or "").strip().upper()
+        search_keyword = url_keyword or expected_credit_code or detail_query_code
         try:
             body_text = await page.locator("body").first.inner_text(timeout=3_000) or ""
         except Exception:
@@ -2306,6 +3130,7 @@ class PlaywrightToolRuntime:
 
         normalized_body = str(body_text or "").upper()
         no_result = "很抱歉，没有找到您搜索的数据" in body_text
+        detail_dom_payload = await self._extract_creditchina_detail_dom_payload_async(page)
 
         dom_candidates_payload = await page.evaluate(
             """
@@ -2367,24 +3192,38 @@ class PlaywrightToolRuntime:
         )
         if selected_candidate is None and len(normalized_candidates) == 1:
             selected_candidate = normalized_candidates[0]
+        if selected_candidate is None and detail_dom_payload.get("has_detail_tabs"):
+            inferred_code = detail_query_code or expected_credit_code
+            selected_candidate = {
+                "accurate_entity_name": url_keyword if url_keyword.upper() != inferred_code else "",
+                "accurate_entity_name_query": url_keyword,
+                "accurate_entity_code": inferred_code,
+                "entityType": str((page_query.get("entityType") or [""])[0] or "").strip(),
+            }
 
         has_credit_code = bool(expected_credit_code) and expected_credit_code in normalized_body
         has_result_keywords = "统一社会信用代码" in body_text and (
             "主体类型" in body_text or "企业法人" in body_text or "共" in body_text
         )
-        result_ready = selected_candidate is not None or (has_credit_code and has_result_keywords)
+        detail_result_ready = bool(
+            detail_dom_payload.get("has_detail_tabs")
+            or detail_dom_payload.get("xzgl_text")
+            or detail_dom_payload.get("result_tab2_text")
+        )
+        result_ready = selected_candidate is not None or (has_credit_code and has_result_keywords) or detail_result_ready
         if selected_candidate is None and result_ready:
             selected_candidate = {
                 "accurate_entity_name": "",
-                "accurate_entity_name_query": "",
-                "accurate_entity_code": expected_credit_code,
+                "accurate_entity_name_query": url_keyword,
+                "accurate_entity_code": detail_query_code or expected_credit_code,
             }
         normalized_payload = (
             self._normalize_creditchina_dom_result(
                 search_keyword=search_keyword,
-                credit_code=expected_credit_code,
+                credit_code=detail_query_code or expected_credit_code,
                 candidate=selected_candidate,
                 body_text=body_text,
+                detail_dom_payload=detail_dom_payload,
             )
             if selected_candidate is not None
             else {}
@@ -2398,6 +3237,7 @@ class PlaywrightToolRuntime:
             "selected_candidate": selected_candidate,
             "candidates": normalized_candidates[:10],
             "normalized": normalized_payload,
+            "detail_dom": detail_dom_payload,
             "body_excerpt": _trim_text(body_text, 600),
         }
 
@@ -2893,10 +3733,13 @@ class PlaywrightToolRuntime:
                 search_json = dict(search_payload.get("json") or {})
 
             if int(search_json.get("status") or 0) != 1 and verify_success_payload is None:
+                verify_error = ""
+                if verify_attempts:
+                    verify_error = str(verify_attempts[-1].get("verify_msg") or "").strip()
                 return {
                     "ok": False,
                     "stage": "verify_failed",
-                    "error": "验证码经 private-api 校验后仍未通过。",
+                    "error": verify_error or "验证码经 private-api 校验后仍未通过。",
                     "seed_state": seed_state,
                     "search": search_json,
                     "search_query": search_extra_query,
@@ -2935,41 +3778,25 @@ class PlaywrightToolRuntime:
             }
 
         detail_url = self._build_creditchina_detail_url(selected_candidate)
-        response = await page.goto(detail_url, wait_until="domcontentloaded")
-        await self._record_navigation_async(page, response, source="creditchina_detail_page")
-        await self._settle_page_async(page, extra_wait_ms=1800)
-        detail_page_diagnosis = await self._diagnose_access_async(page)
-        if detail_page_diagnosis.get("challenge_detected") or detail_page_diagnosis.get("blank_page_like"):
-            retry_payload = await self._retry_on_access_challenge_async(
-                page,
-                artifact_dir,
-                wait_seconds=4,
-                max_retries=2,
-                capture_artifacts=True,
-            )
-            detail_page_diagnosis = dict(retry_payload.get("final_diagnosis") or detail_page_diagnosis)
-            if detail_page_diagnosis.get("challenge_detected") or detail_page_diagnosis.get("blank_page_like"):
-                return {
-                    "ok": False,
-                    "stage": "detail_page_access_failed",
-                    "error": "详情页仍处于挑战/空白状态，无法继续 private-api 详情查询。",
-                    "seed_state": seed_state,
-                    "verify": verify_success_payload,
-                    "search_result": {
-                        "total": search_data.get("total"),
-                        "selected_candidate": selected_candidate,
-                    },
-                    "retry": retry_payload,
-                }
-
-        detail_seed_state = await self._wait_for_creditchina_rcw_async(page, timeout_ms=6_000)
-        detail_runtime_state = dict(detail_seed_state.get("runtime_state") or {})
-        detail_rcw_token = str(detail_runtime_state.get("rcw_token") or rcw_token).strip()
+        detail_query = self._build_creditchina_detail_api_query_from_candidate(
+            selected_candidate,
+            credit_code=normalized_credit_code,
+        )
+        detail_runtime_state = {
+            "keyword": str(detail_query.get("keyword") or ""),
+            "tyshxydm": str(detail_query.get("tyshxydm") or normalized_credit_code),
+            "page_uuid": str(detail_query.get("uuid") or ""),
+            "entity_type": str(detail_query.get("entityType") or selected_candidate.get("entityType") or "1"),
+            "search_state": str(detail_query.get("searchState") or "1"),
+            "scenes": "defaultscenario",
+            "rcw_token": rcw_token,
+        }
+        detail_rcw_token = rcw_token
         detail_payload = await self._creditchina_api_json_request_async(
             page,
             endpoint="getTyshxydmDetailsContent",
             rcw_token=detail_rcw_token,
-            extra_query=self._build_creditchina_detail_api_query(detail_runtime_state),
+            extra_query=detail_query,
         )
         detail_json = dict(detail_payload.get("json") or {})
         detail_verify_payload: dict[str, Any] | None = None
@@ -2987,9 +3814,66 @@ class PlaywrightToolRuntime:
                     page,
                     endpoint="getTyshxydmDetailsContent",
                     rcw_token=detail_rcw_token,
-                    extra_query=self._build_creditchina_detail_api_query(detail_runtime_state),
+                    extra_query=detail_query,
                 )
                 detail_json = dict(detail_payload.get("json") or {})
+        detail_page_retry: dict[str, Any] | None = None
+        if int(detail_json.get("status") or 0) != 1:
+            response = await page.goto(detail_url, wait_until="domcontentloaded")
+            await self._record_navigation_async(page, response, source="creditchina_detail_page")
+            await self._settle_page_async(page, extra_wait_ms=1800)
+            detail_page_diagnosis = await self._diagnose_access_async(page)
+            if detail_page_diagnosis.get("challenge_detected") or detail_page_diagnosis.get("blank_page_like"):
+                detail_page_retry = await self._retry_on_access_challenge_async(
+                    page,
+                    artifact_dir,
+                    wait_seconds=4,
+                    max_retries=2,
+                    capture_artifacts=True,
+                )
+                detail_page_diagnosis = dict(detail_page_retry.get("final_diagnosis") or detail_page_diagnosis)
+                if detail_page_diagnosis.get("challenge_detected") or detail_page_diagnosis.get("blank_page_like"):
+                    return {
+                        "ok": False,
+                        "stage": "detail_page_access_failed",
+                        "error": "详情页仍处于挑战/空白状态，无法继续 private-api 详情查询。",
+                        "seed_state": seed_state,
+                        "verify": verify_success_payload,
+                        "detail": detail_json,
+                        "search_result": {
+                            "total": search_data.get("total"),
+                            "selected_candidate": selected_candidate,
+                        },
+                        "retry": detail_page_retry,
+                    }
+
+            detail_seed_state = await self._wait_for_creditchina_rcw_async(page, timeout_ms=6_000)
+            detail_runtime_state = dict(detail_seed_state.get("runtime_state") or detail_runtime_state)
+            detail_rcw_token = str(detail_runtime_state.get("rcw_token") or rcw_token).strip()
+            detail_query = self._build_creditchina_detail_api_query(detail_runtime_state) or detail_query
+            detail_payload = await self._creditchina_api_json_request_async(
+                page,
+                endpoint="getTyshxydmDetailsContent",
+                rcw_token=detail_rcw_token,
+                extra_query=detail_query,
+            )
+            detail_json = dict(detail_payload.get("json") or {})
+            if self._creditchina_detail_requires_reverify(detail_json):
+                detail_verify_payload, detail_verify_attempts = await self._run_creditchina_private_api_verify_async(
+                    page,
+                    artifact_dir,
+                    rcw_token=detail_rcw_token,
+                    max_attempts=min(max_captcha_attempts, 4),
+                    file_prefix="creditchina-private-api-detail-verify",
+                )
+                if detail_verify_payload is not None:
+                    detail_payload = await self._creditchina_api_json_request_async(
+                        page,
+                        endpoint="getTyshxydmDetailsContent",
+                        rcw_token=detail_rcw_token,
+                        extra_query=detail_query,
+                    )
+                    detail_json = dict(detail_payload.get("json") or {})
         if int(detail_json.get("status") or 0) != 1:
             return {
                 "ok": False,
@@ -3004,13 +3888,22 @@ class PlaywrightToolRuntime:
                     "selected_candidate": selected_candidate,
                 },
                 "detail": detail_json,
+                "retry": detail_page_retry,
             }
 
+        administrative_penalty_payload = await self._fetch_creditchina_administrative_penalty_async(
+            page,
+            artifact_dir,
+            rcw_token=detail_rcw_token,
+            detail_runtime_state=detail_runtime_state,
+            max_captcha_attempts=min(max_captcha_attempts, 4),
+        )
         normalized_payload = self._normalize_creditchina_api_result(
             search_keyword=str(runtime_state.get("keyword") or selected_candidate.get("accurate_entity_name_query") or ""),
             credit_code=normalized_credit_code,
             selected_candidate=selected_candidate,
             detail_payload=detail_json,
+            administrative_penalty_payload=administrative_penalty_payload,
         )
         return {
             "ok": True,
@@ -3027,6 +3920,7 @@ class PlaywrightToolRuntime:
                 "candidates": normalized_candidates[:10],
             },
             "detail": detail_json.get("data") or {},
+            "administrative_penalty": administrative_penalty_payload,
             **normalized_payload,
         }
 
@@ -3299,6 +4193,89 @@ class PlaywrightToolRuntime:
             await page.wait_for_timeout(poll_budget_ms)
             elapsed_ms += poll_budget_ms
 
+    def _find_creditchina_cached_candidate(self, *, credit_code: str, max_files: int = 40) -> dict[str, Any] | None:
+        """从历史成功产物里找最近一次命中过的主体，用于详情页兜底定位。"""
+        normalized_credit_code = str(credit_code or "").strip().upper()
+        if not normalized_credit_code:
+            return None
+        result_files = sorted(
+            RESULTS_DIR.rglob(f"creditchina-{normalized_credit_code}-*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for result_path in result_files[: max(1, min(int(max_files), 200))]:
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            result_payload = payload.get("result_payload") if isinstance(payload, dict) else {}
+            api_flow = result_payload.get("api_flow") if isinstance(result_payload, dict) else {}
+            search_result = api_flow.get("search_result") if isinstance(api_flow, dict) else {}
+            candidate = search_result.get("selected_candidate") if isinstance(search_result, dict) else None
+            if not isinstance(candidate, dict):
+                continue
+            candidate_code = str(candidate.get("accurate_entity_code") or "").strip().upper()
+            if candidate_code != normalized_credit_code:
+                continue
+            return {
+                "selected_candidate": dict(candidate),
+                "source_path": str(result_path),
+            }
+        return None
+
+    async def _try_creditchina_cached_detail_dom_fallback_async(
+        self,
+        page: AsyncPage,
+        artifact_dir: Path,
+        *,
+        credit_code: str,
+    ) -> dict[str, Any]:
+        """当搜索页验证码迟迟无法通过时，直接复用历史命中主体跳详情页取 DOM。"""
+        cached_seed = self._find_creditchina_cached_candidate(credit_code=credit_code)
+        if not isinstance(cached_seed, dict):
+            return {
+                "ok": False,
+                "stage": "cached_candidate_missing",
+                "error": "未找到可复用的历史主体详情定位信息。",
+            }
+
+        selected_candidate = dict(cached_seed.get("selected_candidate") or {})
+        detail_url = self._build_creditchina_detail_url(selected_candidate)
+        response = await page.goto(detail_url, wait_until="domcontentloaded")
+        await self._record_navigation_async(page, response, source="creditchina_cached_detail_page")
+        await self._settle_page_async(page, extra_wait_ms=2400)
+        diagnosis = await self._diagnose_access_async(page)
+        if diagnosis.get("creditchina_captcha_image_broken"):
+            modal_reset = await self._refresh_creditchina_after_captcha_cancel_async(page)
+            diagnosis = dict(modal_reset.get("diagnosis") or diagnosis)
+        page_result_wait = await self._wait_for_creditchina_dom_result_async(
+            page,
+            credit_code=credit_code,
+            timeout_ms=6_000,
+            poll_interval_ms=1_500,
+        )
+        page_result = dict(page_result_wait.get("result") or {})
+        if page_result.get("ok"):
+            return {
+                "ok": True,
+                "stage": "cached_detail_dom_ready",
+                "detail_url": detail_url,
+                "seed": cached_seed,
+                "diagnosis": diagnosis,
+                "page_result_wait": page_result_wait,
+                "page_result": page_result,
+            }
+        return {
+            "ok": False,
+            "stage": "cached_detail_dom_not_ready",
+            "error": "详情页已打开，但 DOM 结果仍未就绪。",
+            "detail_url": detail_url,
+            "seed": cached_seed,
+            "diagnosis": diagnosis,
+            "page_result_wait": page_result_wait,
+            "page_result": page_result,
+        }
+
     async def _captcha_error_present_async(
         self, page: AsyncPage, error_keyword: str = "验证码错误"
     ) -> tuple[bool, str]:
@@ -3512,26 +4489,34 @@ class PlaywrightToolRuntime:
                     "saved_result": saved_result,
                 }
             if final_diagnosis.get("challenge_detected") or final_diagnosis.get("blank_page_like"):
-                saved_result = None
-                if save_failure_result:
-                    saved_result = await self._write_creditchina_result_files_async(
-                        page,
-                        artifact_dir,
-                        credit_code=normalized_credit_code,
-                        succeeded=False,
-                        stage="access_failed",
-                        error_message="命中安全挑战页，未进入可查询页面。",
-                        base_name=result_name,
-                        result_payload={"prepare": prepare, "retry": retry_payload, "mode": "private_api"},
-                    )
-                return {
-                    "ok": False,
-                    "credit_code": normalized_credit_code,
-                    "stage": "access_failed",
-                    "prepare": prepare,
-                    "retry": retry_payload,
-                    "saved_result": saved_result,
-                }
+                seed_state = await self._wait_for_creditchina_rcw_async(page, timeout_ms=1_500)
+                if not str((seed_state.get("runtime_state") or {}).get("rcw_token") or "").strip():
+                    saved_result = None
+                    if save_failure_result:
+                        saved_result = await self._write_creditchina_result_files_async(
+                            page,
+                            artifact_dir,
+                            credit_code=normalized_credit_code,
+                            succeeded=False,
+                            stage="access_failed",
+                            error_message="命中安全挑战页，且未能从当前会话提取可用的 private-api token。",
+                            base_name=result_name,
+                            result_payload={
+                                "prepare": prepare,
+                                "retry": retry_payload,
+                                "seed_state": seed_state,
+                                "mode": "private_api",
+                            },
+                        )
+                    return {
+                        "ok": False,
+                        "credit_code": normalized_credit_code,
+                        "stage": "access_failed",
+                        "prepare": prepare,
+                        "retry": retry_payload,
+                        "seed_state": seed_state,
+                        "saved_result": saved_result,
+                    }
 
         api_flow = await self._run_creditchina_private_api_query_async(
             page,
@@ -3806,6 +4791,41 @@ class PlaywrightToolRuntime:
                     "api_flow": private_api_attempt,
                     "prepare": prepare,
                     "captcha": captcha_state,
+                    "saved_result": saved,
+                }
+            cached_detail_fallback = await self._try_creditchina_cached_detail_dom_fallback_async(
+                page,
+                artifact_dir,
+                credit_code=normalized_credit_code,
+            )
+            if cached_detail_fallback.get("ok"):
+                page_result = dict(cached_detail_fallback.get("page_result") or {})
+                text_payload = json.dumps(page_result.get("normalized") or page_result, ensure_ascii=False, indent=2)
+                saved = await self._write_creditchina_result_files_async(
+                    page,
+                    artifact_dir,
+                    credit_code=normalized_credit_code,
+                    succeeded=True,
+                    stage="cached_detail_dom_saved",
+                    base_name=result_name,
+                    result_payload={
+                        "api_flow": private_api_attempt,
+                        "prepare": prepare,
+                        "captcha": captcha_state,
+                        "cached_detail": cached_detail_fallback,
+                        "page_result": page_result,
+                        "page_result_wait": cached_detail_fallback.get("page_result_wait"),
+                        "mode": "cached_detail_dom_fallback",
+                    },
+                    text_payload=text_payload,
+                )
+                return {
+                    "ok": True,
+                    "credit_code": normalized_credit_code,
+                    "api_flow": private_api_attempt,
+                    "prepare": prepare,
+                    "captcha": captcha_state,
+                    "cached_detail": cached_detail_fallback,
                     "saved_result": saved,
                 }
             saved = await self._write_creditchina_result_files_async(

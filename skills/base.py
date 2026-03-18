@@ -135,6 +135,13 @@ def _build_creditchina_reply(result: dict[str, Any]) -> str:
     normalized_payload = _extract_creditchina_normalized_payload(result)
     normalized = normalized_payload.get("normalized") if isinstance(normalized_payload, dict) else {}
     if isinstance(normalized, dict) and normalized:
+        administrative_management = (
+            normalized.get("administrative_management")
+            if isinstance(normalized.get("administrative_management"), dict)
+            else {}
+        )
+        penalty_notices = normalized.get("penalty_notices") if isinstance(normalized.get("penalty_notices"), dict) else {}
+        penalty_records = list(penalty_notices.get("records") or [])
         lines = [
             "信用中国查询已完成。",
             f"企业名称：{normalized.get('enterprise_name') or '未返回'}",
@@ -145,7 +152,22 @@ def _build_creditchina_reply(result: dict[str, Any]) -> str:
             f"成立日期：{normalized.get('establish_date') or '未返回'}",
             f"住所：{normalized.get('address') or '未返回'}",
             f"登记机关：{normalized.get('registration_authority') or '未返回'}",
+            f"行政管理总量：{administrative_management.get('total') if administrative_management else '未返回'}",
+            f"处罚通告数量：{penalty_notices.get('total') if penalty_notices else '未返回'}",
         ]
+        for index, item in enumerate(penalty_records[:3], start=1):
+            record = dict(item or {})
+            summary = (
+                record.get("content")
+                or record.get("document_number")
+                or record.get("authority")
+                or record.get("category_name")
+                or "未返回"
+            )
+            lines.append(
+                f"处罚通告{index}：{record.get('decision_date') or '-'} | "
+                f"{record.get('category_name') or '处罚通告'} | {summary}"
+            )
         return "\n".join(lines)
     if result.get("ok"):
         saved_result = result.get("saved_result") if isinstance(result, dict) else {}

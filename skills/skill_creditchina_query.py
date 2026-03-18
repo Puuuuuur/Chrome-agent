@@ -21,7 +21,7 @@ class CreditChinaQuerySkill(AgentSkill):
 
     name = "creditchina_query"
     title = "信用中国固定查询"
-    description = "执行信用中国固定查询 skill，优先走 private-api 流，失败后回退 DOM + 验证码流程。"
+    description = "执行信用中国固定查询 skill，进入详情页后继续抓取行政管理/处罚通告明细，失败时再回退 DOM + 验证码流程。"
     input_schema = {
         "type": "object",
         "required": ["credit_code"],
@@ -59,7 +59,7 @@ class CreditChinaQuerySkill(AgentSkill):
             "执行约束：\n"
             "1. 先复用浏览器真实会话与当前站点上下文。\n"
             "2. 优先跑 private-api 查询流；如果当前只是搜索结果列表页命中主体，不要视为完成，要继续进入详情页或详情接口。\n"
-            "3. 只有拿到详情页字段或 private-api 详情字段后，才算查询完成。\n"
+            "3. 进入详情页后，必须继续抓取“行政管理/处罚通告”明细，而不是停在基础信息。\n"
             "4. 只有当 private-api 和详情页都失败时，才允许回退成列表页简版结果。\n"
             "5. 最终必须把结果写到当前运行目录，并返回可直接给人阅读的结果摘要。"
         )
@@ -80,7 +80,11 @@ class CreditChinaQuerySkill(AgentSkill):
             "mode": "creditchina_direct",
             "reply": _build_creditchina_reply(query_result),
             "credit_code": credit_code,
-            "normalized": normalized_payload.get("normalized") if isinstance(normalized_payload, dict) else {},
+            "normalized": (
+                normalized_payload.get("normalized")
+                if isinstance(normalized_payload, dict) and isinstance(normalized_payload.get("normalized"), dict)
+                else {}
+            ),
             "query_result": query_result,
             "page_result": _extract_creditchina_page_result(query_result),
             "used_tools": ["run_creditchina_query_and_save"],

@@ -250,20 +250,20 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
     }}
 
     .composer {{
-      padding: 16px 20px 20px;
+      padding: 12px 16px 16px;
       border-top: 1px solid rgba(36, 44, 55, 0.08);
       background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 247, 244, 0.94));
       display: grid;
-      gap: 12px;
+      gap: 10px;
     }}
 
     .composer-box {{
       display: grid;
-      gap: 12px;
-      padding: 14px;
+      gap: 10px;
+      padding: 12px;
       width: min(1120px, 100%);
       margin: 0 auto;
-      border-radius: 18px;
+      border-radius: 20px;
       border: 1px solid rgba(67, 88, 106, 0.12);
       background: var(--panel-strong);
       box-shadow: 0 10px 24px rgba(31, 39, 47, 0.05);
@@ -279,19 +279,19 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
     .prompt-row {{
       display: flex;
       flex-wrap: wrap;
-      gap: 10px;
+      gap: 8px;
     }}
 
     .prompt-chip {{
       display: inline-flex;
       align-items: center;
-      min-height: 40px;
-      padding: 8px 14px;
+      min-height: 34px;
+      padding: 6px 12px;
       border-radius: 999px;
       border: 1px solid rgba(67, 88, 106, 0.12);
       background: rgba(255, 255, 255, 0.76);
       color: #314552;
-      font-size: 14px;
+      font-size: 13px;
       line-height: 1.4;
       cursor: pointer;
       transition:
@@ -314,10 +314,21 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       outline-offset: 2px;
     }}
 
+    .composer-input-row {{
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 18px;
+      border: 1px solid rgba(67, 88, 106, 0.10);
+      background: linear-gradient(180deg, rgba(247, 248, 250, 0.92), rgba(255, 255, 255, 0.98));
+    }}
+
     .composer-textarea {{
+      flex: 1;
       width: 100%;
-      min-height: 24px;
-      max-height: 220px;
+      min-height: 22px;
+      max-height: 120px;
       border: 0;
       resize: none;
       outline: none;
@@ -325,7 +336,7 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       margin: 0;
       background: transparent;
       color: var(--text);
-      line-height: 1.75;
+      line-height: 1.55;
       font-size: 15px;
     }}
 
@@ -336,28 +347,32 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
     .composer-actions {{
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
+      justify-content: flex-start;
+      gap: 8px;
     }}
 
     .composer-hint {{
       color: var(--muted);
-      font-size: 13px;
-      line-height: 1.6;
+      font-size: 12px;
+      line-height: 1.5;
     }}
 
     .composer-submit {{
-      min-width: 108px;
-      min-height: 46px;
+      flex: 0 0 auto;
+      width: 42px;
+      height: 42px;
+      min-width: 42px;
+      min-height: 42px;
       border: 0;
-      border-radius: 14px;
+      border-radius: 999px;
       background: linear-gradient(135deg, #43586a, #607587);
       color: #fff;
-      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       cursor: pointer;
       transition: transform 180ms ease, box-shadow 180ms ease, opacity 180ms ease;
-      box-shadow: 0 14px 28px rgba(67, 88, 106, 0.22);
+      box-shadow: 0 10px 20px rgba(67, 88, 106, 0.20);
     }}
 
     .composer-submit:hover {{
@@ -371,6 +386,86 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       box-shadow: none;
     }}
 
+    body.embedded {{
+      background:
+        linear-gradient(180deg, rgba(240, 244, 248, 0.96), rgba(233, 239, 246, 0.98));
+    }}
+
+    body.embedded .page {{
+      background: transparent;
+    }}
+
+    body.embedded .chat-feed {{
+      padding: 16px 16px 12px;
+      gap: 14px;
+      background:
+        radial-gradient(420px 180px at 100% 0%, rgba(67, 88, 106, 0.04), transparent 58%),
+        linear-gradient(180deg, rgba(248, 250, 252, 0.82), rgba(241, 245, 249, 0.96));
+    }}
+
+    body.embedded .bubble {{
+      border-radius: 16px;
+      box-shadow: 0 10px 18px rgba(31, 39, 47, 0.04);
+    }}
+
+    body.embedded .typing {{
+      padding: 0 16px 8px;
+      font-size: 12px;
+    }}
+
+    body.embedded .composer {{
+      padding: 8px 10px 10px;
+      gap: 8px;
+      background: linear-gradient(180deg, rgba(247, 249, 252, 0.98), rgba(241, 245, 249, 0.98));
+    }}
+
+    body.embedded .composer-box {{
+      gap: 8px;
+      padding: 8px;
+      border-radius: 18px;
+      border-color: rgba(67, 88, 106, 0.08);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.9),
+        0 6px 16px rgba(31, 39, 47, 0.04);
+    }}
+
+    body.embedded .prompt-chip {{
+      min-height: 30px;
+      padding: 4px 10px;
+      font-size: 12px;
+    }}
+
+    body.embedded .composer-input-row {{
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 16px;
+      border-color: rgba(67, 88, 106, 0.08);
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow:
+        inset 0 0 0 1px rgba(255, 255, 255, 0.72),
+        0 6px 14px rgba(31, 39, 47, 0.04);
+    }}
+
+    body.embedded .composer-textarea {{
+      min-height: 20px;
+      max-height: 88px;
+      font-size: 14px;
+      line-height: 1.45;
+    }}
+
+    body.embedded .composer-submit {{
+      width: 38px;
+      height: 38px;
+      min-width: 38px;
+      min-height: 38px;
+      box-shadow: 0 8px 16px rgba(67, 88, 106, 0.18);
+    }}
+
+    body.embedded .composer-hint {{
+      font-size: 11px;
+      color: rgba(91, 104, 116, 0.9);
+    }}
+
     @media (max-width: 820px) {{
       .chat-feed {{
         padding: 16px 14px 16px;
@@ -381,11 +476,22 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
       }}
 
       .composer {{
-        padding: 14px 14px 16px;
+        padding: 10px 12px 14px;
       }}
 
-      .composer-textarea {{
-        min-height: 104px;
+      .composer-box {{
+        padding: 10px;
+      }}
+
+      .composer-input-row {{
+        padding: 9px 10px;
+      }}
+
+      .composer-submit {{
+        width: 40px;
+        height: 40px;
+        min-width: 40px;
+        min-height: 40px;
       }}
     }}
   </style>
@@ -403,15 +509,19 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
     <form id='composer-form' class='composer'>
       <div class='composer-box'>
         <div class='prompt-row'>
-          <button type='button' class='prompt-chip' data-prompt='进入 https://www.creditchina.gov.cn/ ，使用统一社会信用代码 91420000177570439L 完成一次完整的信用中国固定查询，并把最终结果保存到文件。要求：1. 不能把搜索结果列表页当成最终完成；如果当前只是列表页命中结果，继续进入企业详情页。2. 只有拿到详情页字段或 private-api 详情字段后，才算查询完成。3. 如果 private-api 和详情页都失败，才允许回退成列表页简版结果，并明确告诉我这是回退结果。4. 最终请告诉我企业名称、统一社会信用代码、法定代表人/负责人、成立日期、住所、登记机关，以及结果文件路径。'>跑完整查询 / 信用中国固定查询</button>
-          <button type='button' class='prompt-chip' data-prompt='先观察当前页面，列出主要输入框、按钮、图片和它们的 selector。'>看页面 selector</button>
-          <button type='button' class='prompt-chip' data-prompt='如果页面结构变了，请你自己重新观察 DOM，再规划下一步操作。'>让它自己规划</button>
-          <button type='button' class='prompt-chip' data-prompt='如果页面是空白页或可见元素为空，请继续等待、判断是否是挑战页，并保存完整 HTML 和整页截图给我。'>排查空白页</button>
+          <button type='button' class='prompt-chip' data-prompt='进入 https://www.creditchina.gov.cn/ ，使用统一社会信用代码 91420000177570439L 完成一次完整的信用中国固定查询，并把最终结果保存到文件。要求：1. 不能把搜索结果列表页当成最终完成；如果当前只是列表页命中结果，继续进入企业详情页。2. 只有拿到详情页字段或 private-api 详情字段后，才算查询完成。3. 如果 private-api 和详情页都失败，才允许回退成列表页简版结果，并明确告诉我这是回退结果。4. 最终请告诉我企业名称、统一社会信用代码、法定代表人/负责人、成立日期、住所、登记机关，以及结果文件路径。'>信用中国固定查询</button>
         </div>
-        <textarea id='composer-input' class='composer-textarea' placeholder='直接输入你的问题，比如：先观察页面结构，再完成一次查询。'></textarea>
+        <div class='composer-input-row'>
+          <textarea id='composer-input' class='composer-textarea' placeholder='直接输入你的问题，比如：先观察页面结构，再完成一次查询。'></textarea>
+          <button id='send-btn' type='submit' class='composer-submit' aria-label='发送'>
+            <svg viewBox='0 0 24 24' width='18' height='18' fill='none' xmlns='http://www.w3.org/2000/svg' aria-hidden='true'>
+              <path d='M4 12.5L18.5 5L15 19L11 13.5L4 12.5Z' fill='currentColor'/>
+              <path d='M10.5 13.5L18.5 5' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/>
+            </svg>
+          </button>
+        </div>
         <div class='composer-actions'>
           <div class='composer-hint'>Enter 发送，Shift + Enter 换行。当前后端仍然是浏览器 Agent。</div>
-          <button id='send-btn' type='submit' class='composer-submit'>发送</button>
         </div>
       </div>
     </form>
@@ -492,8 +602,11 @@ def render_playwright_agent_page(embedded: bool = False) -> str:
     }}
 
     function syncComposerHeight() {{
+      const embeddedMode = document.body.classList.contains('embedded');
+      const minHeight = embeddedMode ? 20 : 22;
+      const maxHeight = embeddedMode ? 88 : 120;
       composerInput.style.height = '0px';
-      const nextHeight = Math.max(24, Math.min(composerInput.scrollHeight, 220));
+      const nextHeight = Math.max(minHeight, Math.min(composerInput.scrollHeight, maxHeight));
       composerInput.style.height = nextHeight + 'px';
     }}
 
